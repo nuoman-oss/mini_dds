@@ -1,0 +1,16 @@
+# build directory
+build/
+
+# cmake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# binaries
+publisher
+subscriber
+
+# IDE
+.vscode/
+.idea/
