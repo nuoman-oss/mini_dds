@@ -11,7 +11,13 @@ int main()
 {
     using namespace mini_dds::dds;
 
-    DomainParticipant participant({0, 0, "0.0.0.0", 8000});
+    ParticipantConfig participant_config;
+    participant_config.domain_id = 0;
+    participant_config.participant_id = 0;
+    participant_config.enable_discovery = true;
+    participant_config.advertised_address = "127.0.0.1";
+    participant_config.participant_name = "mini_dds_publisher";
+    DomainParticipant participant(participant_config);
     if (!participant.is_valid()) {
         std::cerr << "participant creation failed: "
                   << participant.last_error() << '\n';
@@ -25,7 +31,7 @@ int main()
     const auto publisher = participant.create_publisher();
 
     DataWriterConfig writer_config;
-    writer_config.remote_endpoint = {"127.0.0.1", 9000};
+    writer_config.discovery_timeout = std::chrono::seconds(5);
     auto writer = publisher.create_datawriter(topic, writer_config);
 
     for (int index = 1; index <= 5; ++index) {

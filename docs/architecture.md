@@ -271,18 +271,25 @@ MVP 使用简单且可控的线程模型：
 
 当前 M3 有意保留以下限制：
 
-- Topic 名和类型名尚未进入发现数据，固定端口隐式代表一个 Topic；
 - 一个 Participant 暂时只应有一个主动收包的 DataReader；
-- Writer 必须显式配置远端地址；
+- Writer 可以使用固定远端，也可以通过 SEDP 自动匹配，但暂时只发送给第一个匹配 Reader；
 - Reliable QoS 会明确返回“不支持”，不会静默降级。
 
-### M4：自动发现
+### M4：自动发现（已完成最小版本）
 
-- [ ] UDP 组播；
-- [ ] ParameterList；
-- [ ] SPDP Participant Discovery；
-- [ ] SEDP Endpoint Discovery；
-- [ ] Topic 与类型匹配。
+- [x] UDP 组播；
+- [x] ParameterList；
+- [x] SPDP Participant Discovery 与租约过期；
+- [x] SEDP Endpoint Discovery；
+- [x] Topic 与类型匹配。
+
+当前 M4 限制：
+
+- SEDP 尚未使用 Reliable 内建端点状态机，而是通过周期性重复公告提高容错；
+- 尚未处理第三方实现常用的复合 Submessage、更多 PID 和兼容性规则；
+- Endpoint 删除尚未发送 dispose，远端记录会随 Participant 租约清理；
+- 同一 Writer 暂时只选择第一个匹配 Reader，尚未实现一对多 fan-out；
+- 使用未分配的实验 VendorId，因此不宣称第三方互操作。
 
 ### M5：可靠性与 QoS
 

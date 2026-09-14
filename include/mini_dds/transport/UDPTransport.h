@@ -29,6 +29,13 @@ public:
         const std::string& address,
         std::uint16_t port);
 
+    bool join_multicast_group(
+        const std::string& group_address,
+        const std::string& interface_address = "0.0.0.0");
+
+    bool set_multicast_interface(const std::string& interface_address);
+    bool set_multicast_loopback(bool enabled);
+
     // Blocking compatibility overload for the original prototype API.
     std::vector<std::uint8_t> receive();
 

@@ -10,7 +10,13 @@ int main()
 {
     using namespace mini_dds::dds;
 
-    DomainParticipant participant({0, 1, "0.0.0.0", 9000});
+    ParticipantConfig participant_config;
+    participant_config.domain_id = 0;
+    participant_config.participant_id = 1;
+    participant_config.enable_discovery = true;
+    participant_config.advertised_address = "127.0.0.1";
+    participant_config.participant_name = "mini_dds_subscriber";
+    DomainParticipant participant(participant_config);
     if (!participant.is_valid()) {
         std::cerr << "participant creation failed: "
                   << participant.last_error() << '\n';
@@ -24,7 +30,8 @@ int main()
     const auto subscriber = participant.create_subscriber();
     auto reader = subscriber.create_datareader(topic);
 
-    std::cout << "waiting for Topic '" << topic.name() << "' on port 9000\n";
+    std::cout << "waiting for Topic '" << topic.name()
+              << "' with automatic discovery\n";
     for (int index = 0; index < 5; ++index) {
         std::string sample;
         const auto result = reader->take(sample, std::chrono::seconds(10));

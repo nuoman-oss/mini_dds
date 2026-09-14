@@ -1,5 +1,9 @@
 #include "mini_dds/dds/DomainParticipant.h"
 #include "mini_dds/dds/TypeSupport.h"
+#include "mini_dds/discovery/DiscoveryData.h"
+#include "mini_dds/discovery/ParameterList.h"
+#include "mini_dds/discovery/PortMapping.h"
+#include "mini_dds/discovery/DiscoveryService.h"
 #include "mini_dds/history/History.h"
 #include "mini_dds/rtps/Data.h"
 #include "mini_dds/rtps/Message.h"
@@ -14,6 +18,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -349,6 +354,69 @@ void test_dds_api_fixed_endpoint()
         "unsupported reliable QoS fails explicitly");
 }
 
+void test_dds_api_automatic_discovery()
+{
+    using namespace mini_dds;
+
+    dds::ParticipantConfig subscriber_config;
+    subscriber_config.domain_id = 92;
+    subscriber_config.participant_id = 32;
+    subscriber_config.bind_address = "0.0.0.0";
+    subscriber_config.listen_port = 0;
+    subscriber_config.enable_discovery = true;
+    subscriber_config.advertised_address = "127.0.0.1";
+    subscriber_config.participant_name = "dds-auto-subscriber";
+    subscriber_config.announcement_period = std::chrono::milliseconds(100);
+    subscriber_config.lease_duration = std::chrono::seconds(2);
+
+    auto publisher_config = subscriber_config;
+    publisher_config.participant_id = 33;
+    publisher_config.participant_name = "dds-auto-publisher";
+
+    dds::DomainParticipant subscriber_participant(subscriber_config);
+    dds::DomainParticipant publisher_participant(publisher_config);
+    check(
+        subscriber_participant.is_valid(),
+        "auto-discovery subscriber participant starts: " +
+            subscriber_participant.last_error());
+    check(
+        publisher_participant.is_valid(),
+        "auto-discovery publisher participant starts: " +
+            publisher_participant.last_error());
+    if (!subscriber_participant.is_valid() || !publisher_participant.is_valid()) {
+        return;
+    }
+
+    const auto type_support = std::make_shared<dds::StringTypeSupport>();
+    const auto reader_topic = subscriber_participant.create_topic<std::string>(
+        "DiscoveredGreeting",
+        type_support);
+    const auto writer_topic = publisher_participant.create_topic<std::string>(
+        "DiscoveredGreeting",
+        type_support);
+
+    auto subscriber = subscriber_participant.create_subscriber();
+    auto reader = subscriber.create_datareader(reader_topic);
+    auto publisher = publisher_participant.create_publisher();
+    dds::DataWriterConfig writer_config;
+    writer_config.discovery_timeout = std::chrono::seconds(3);
+    auto writer = publisher.create_datawriter(writer_topic, writer_config);
+
+    check(
+        writer->write("automatically discovered sample"),
+        "DataWriter discovers matching DataReader: " + writer->last_error());
+
+    std::string sample;
+    const auto result = reader->take(sample, std::chrono::seconds(2));
+    check(result.ok(), "discovered DataReader receives sample: " + result.error);
+    check(
+        sample == "automatically discovered sample",
+        "automatic-discovery typed value round trip");
+    check(
+        publisher_participant.discovered_participant_count() >= 1,
+        "DomainParticipant exposes discovered participant count");
+}
+
 void test_udp_loopback()
 {
     using namespace mini_dds::transport;
@@ -381,6 +449,252 @@ void test_udp_loopback()
     check(
         !sender.send(payload, Endpoint{"not-an-ip", 9000}),
         "UDP rejects invalid destination address");
+    check(
+        !sender.join_multicast_group("127.0.0.1"),
+        "UDP rejects a non-multicast group");
+}
+
+void test_rtps_port_mapping()
+{
+    const mini_dds::discovery::PortMapping ports;
+    check(ports.spdp_multicast_port(0) == 7400, "domain 0 SPDP multicast port");
+    check(ports.spdp_unicast_port(0, 0) == 7410, "participant 0 SPDP unicast port");
+    check(ports.user_multicast_port(0) == 7401, "domain 0 user multicast port");
+    check(ports.user_unicast_port(0, 0) == 7411, "participant 0 user port");
+    check(ports.spdp_multicast_port(1) == 7650, "domain gain is applied");
+    check(ports.spdp_unicast_port(1, 3) == 7666, "participant gain is applied");
+    check(!ports.spdp_multicast_port(1000).has_value(), "port overflow is rejected");
+}
+
+void test_parameter_list_codec()
+{
+    using namespace mini_dds;
+
+    const discovery::ParameterList input{
+        {discovery::pid_topic_name, {0xaa, 0xbb, 0xcc}},
+        {0x1234, {0x10, 0x20, 0x30, 0x40}}};
+    std::vector<std::uint8_t> payload;
+    std::string error;
+    check(
+        discovery::encode_parameter_list(
+            input,
+            serialization::Endianness::little,
+            payload,
+            error),
+        "ParameterList encodes: " + error);
+    const std::vector<std::uint8_t> first_parameter{
+        0x00, 0x03, 0x00, 0x00,
+        0x05, 0x00, 0x04, 0x00,
+        0xaa, 0xbb, 0xcc, 0x00};
+    check(
+        payload.size() >= first_parameter.size() &&
+        std::equal(first_parameter.begin(), first_parameter.end(), payload.begin()),
+        "ParameterList representation, header, and padding bytes");
+
+    discovery::ParameterList decoded;
+    serialization::Endianness endianness;
+    check(
+        discovery::decode_parameter_list(payload, decoded, endianness, error),
+        "ParameterList decodes: " + error);
+    check(endianness == serialization::Endianness::little, "ParameterList endianness");
+    check(decoded.size() == 2, "ParameterList parameter count");
+    const auto* topic = discovery::find_parameter(decoded, discovery::pid_topic_name);
+    check(
+        topic != nullptr &&
+        topic->value == std::vector<std::uint8_t>({0xaa, 0xbb, 0xcc, 0x00}),
+        "ParameterList retains padded parameter value");
+
+    payload.resize(payload.size() - 4U);
+    check(
+        !discovery::decode_parameter_list(payload, decoded, endianness, error),
+        "ParameterList requires PID_SENTINEL");
+}
+
+void test_discovery_data_codecs()
+{
+    using namespace mini_dds;
+
+    rtps::GuidPrefix prefix;
+    prefix.value = {
+        0x00, 0x00, 0x12, 0x13, 0x14, 0x15,
+        0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b};
+
+    discovery::ParticipantDiscoveryData participant;
+    participant.participant_guid = {prefix, discovery::entity_id_participant};
+    participant.metatraffic_unicast_locator = {"127.0.0.1", 7412};
+    participant.default_unicast_locator = {"127.0.0.1", 7413};
+    participant.lease_duration = std::chrono::milliseconds(2500);
+    participant.name = "participant-one";
+
+    std::vector<std::uint8_t> payload;
+    std::string error;
+    check(
+        discovery::encode_participant_discovery_data(
+            participant,
+            serialization::Endianness::little,
+            payload,
+            error),
+        "participant discovery data encodes: " + error);
+    check(
+        payload.size() >= 4 && payload[0] == 0x00 && payload[1] == 0x03,
+        "participant discovery uses PL_CDR_LE");
+
+    discovery::ParticipantDiscoveryData decoded_participant;
+    check(
+        discovery::decode_participant_discovery_data(
+            payload,
+            decoded_participant,
+            error),
+        "participant discovery data decodes: " + error);
+    check(
+        decoded_participant.participant_guid == participant.participant_guid,
+        "participant discovery GUID round trip");
+    check(
+        decoded_participant.metatraffic_unicast_locator ==
+            participant.metatraffic_unicast_locator,
+        "participant metatraffic locator round trip");
+    check(
+        decoded_participant.default_unicast_locator ==
+            participant.default_unicast_locator,
+        "participant default locator round trip");
+    check(
+        decoded_participant.lease_duration == participant.lease_duration,
+        "participant lease duration round trip");
+    check(decoded_participant.name == participant.name, "participant name round trip");
+
+    discovery::EndpointDiscoveryData endpoint;
+    endpoint.kind = discovery::DiscoveredEndpointKind::reader;
+    endpoint.endpoint_guid = {
+        prefix,
+        rtps::EntityId{{0x00, 0x00, 0x01, 0x04}}};
+    endpoint.participant_guid = participant.participant_guid;
+    endpoint.topic_name = "Greeting";
+    endpoint.type_name = "mini_dds::String";
+    endpoint.unicast_locator = {"192.168.1.10", 7655};
+    endpoint.reliable = true;
+
+    check(
+        discovery::encode_endpoint_discovery_data(
+            endpoint,
+            serialization::Endianness::big,
+            payload,
+            error),
+        "endpoint discovery data encodes: " + error);
+    discovery::EndpointDiscoveryData decoded_endpoint;
+    check(
+        discovery::decode_endpoint_discovery_data(
+            payload,
+            discovery::DiscoveredEndpointKind::reader,
+            decoded_endpoint,
+            error),
+        "endpoint discovery data decodes: " + error);
+    check(decoded_endpoint.endpoint_guid == endpoint.endpoint_guid, "endpoint GUID round trip");
+    check(decoded_endpoint.participant_guid == endpoint.participant_guid, "endpoint participant GUID");
+    check(decoded_endpoint.topic_name == endpoint.topic_name, "endpoint Topic round trip");
+    check(decoded_endpoint.type_name == endpoint.type_name, "endpoint type round trip");
+    check(
+        decoded_endpoint.unicast_locator == endpoint.unicast_locator,
+        "endpoint locator round trip");
+    check(decoded_endpoint.reliable, "endpoint reliability round trip");
+}
+
+void test_spdp_sedp_discovery_service()
+{
+    using namespace mini_dds;
+
+    transport::UdpTransport user_transport_a(0, "127.0.0.1");
+    transport::UdpTransport user_transport_b(0, "127.0.0.1");
+    check(user_transport_a.is_open(), "discovery user transport A opens");
+    check(user_transport_b.is_open(), "discovery user transport B opens");
+    if (!user_transport_a.is_open() || !user_transport_b.is_open()) {
+        return;
+    }
+
+    rtps::GuidPrefix prefix_a;
+    prefix_a.value = {
+        0x00, 0x00, 0xa1, 0xa2, 0xa3, 0xa4,
+        0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa};
+    rtps::GuidPrefix prefix_b;
+    prefix_b.value = {
+        0x00, 0x00, 0xb1, 0xb2, 0xb3, 0xb4,
+        0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba};
+
+    discovery::DiscoveryConfig config_a;
+    config_a.domain_id = 91;
+    config_a.participant_id = 30;
+    config_a.guid_prefix = prefix_a;
+    config_a.user_unicast_locator = {
+        "127.0.0.1",
+        user_transport_a.local_endpoint().port};
+    config_a.bind_address = "0.0.0.0";
+    config_a.advertised_address = "127.0.0.1";
+    config_a.participant_name = "discovery-a";
+    config_a.announcement_period = std::chrono::milliseconds(100);
+    config_a.lease_duration = std::chrono::milliseconds(500);
+
+    auto config_b = config_a;
+    config_b.participant_id = 31;
+    config_b.guid_prefix = prefix_b;
+    config_b.user_unicast_locator = {
+        "127.0.0.1",
+        user_transport_b.local_endpoint().port};
+    config_b.participant_name = "discovery-b";
+
+    discovery::DiscoveryService service_a(config_a);
+    auto service_b = std::make_unique<discovery::DiscoveryService>(config_b);
+    check(service_a.is_valid(), "SPDP service A starts: " + service_a.last_error());
+    check(service_b->is_valid(), "SPDP service B starts: " + service_b->last_error());
+    if (!service_a.is_valid() || !service_b->is_valid()) {
+        return;
+    }
+
+    const rtps::EntityId writer_id{{0x00, 0x00, 0x11, 0x03}};
+    const rtps::EntityId reader_id{{0x00, 0x00, 0x12, 0x04}};
+    discovery::EndpointDiscoveryData writer;
+    writer.kind = discovery::DiscoveredEndpointKind::writer;
+    writer.endpoint_guid = {prefix_a, writer_id};
+    writer.topic_name = "AutoGreeting";
+    writer.type_name = "mini_dds::String";
+    service_a.announce_local_endpoint(writer);
+
+    discovery::EndpointDiscoveryData reader;
+    reader.kind = discovery::DiscoveredEndpointKind::reader;
+    reader.endpoint_guid = {prefix_b, reader_id};
+    reader.topic_name = "AutoGreeting";
+    reader.type_name = "mini_dds::String";
+    service_b->announce_local_endpoint(reader);
+
+    check(
+        service_a.wait_for_participant(prefix_b, std::chrono::seconds(3)),
+        "SPDP A discovers participant B: " + service_a.last_error());
+    check(
+        service_b->wait_for_participant(prefix_a, std::chrono::seconds(3)),
+        "SPDP B discovers participant A: " + service_b->last_error());
+
+    const auto matched_reader = service_a.wait_for_reader(
+        "AutoGreeting",
+        "mini_dds::String",
+        false,
+        std::chrono::seconds(3));
+    check(matched_reader.has_value(), "SEDP writer finds matching reader");
+    if (matched_reader) {
+        check(matched_reader->endpoint_guid == reader.endpoint_guid, "SEDP reader GUID");
+        check(
+            matched_reader->unicast_locator == config_b.user_unicast_locator,
+            "SEDP reader user locator");
+    }
+
+    service_b.reset();
+    const auto expiry_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (service_a.remote_participant_count() != 0 &&
+           std::chrono::steady_clock::now() < expiry_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    check(
+        service_a.remote_participant_count() == 0 &&
+            service_a.remote_endpoint_count() == 0,
+        "SPDP lease expiry removes participant and SEDP endpoints");
 }
 
 } // namespace
@@ -395,8 +709,13 @@ int main()
     test_rtps_data_message();
     test_history_cache();
     test_udp_loopback();
+    test_rtps_port_mapping();
+    test_parameter_list_codec();
+    test_discovery_data_codecs();
+    test_spdp_sedp_discovery_service();
     test_stateless_best_effort_path();
     test_dds_api_fixed_endpoint();
+    test_dds_api_automatic_discovery();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

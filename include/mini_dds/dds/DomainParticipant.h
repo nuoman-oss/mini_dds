@@ -2,6 +2,7 @@
 
 #include "mini_dds/dds/Qos.h"
 #include "mini_dds/dds/Topic.h"
+#include "mini_dds/discovery/DiscoveryService.h"
 #include "mini_dds/rtps/StatelessEndpoint.h"
 #include "mini_dds/transport/UDPTransport.h"
 
@@ -22,6 +23,11 @@ struct ParticipantConfig {
     std::uint32_t participant_id{0};
     std::string bind_address{"0.0.0.0"};
     std::uint16_t listen_port{0};
+    bool enable_discovery{false};
+    std::string advertised_address{"127.0.0.1"};
+    std::string participant_name{"mini_dds"};
+    std::chrono::milliseconds announcement_period{1000};
+    std::chrono::milliseconds lease_duration{10000};
 };
 
 struct DataWriterConfig {
@@ -29,6 +35,7 @@ struct DataWriterConfig {
     rtps::EntityId remote_reader_id{};
     std::optional<rtps::EntityId> writer_id;
     EndpointQos qos;
+    std::chrono::milliseconds discovery_timeout{3000};
 };
 
 struct DataReaderConfig {
@@ -58,6 +65,7 @@ struct ParticipantState {
     ParticipantConfig config;
     rtps::GuidPrefix guid_prefix;
     std::shared_ptr<transport::UdpTransport> transport;
+    std::shared_ptr<discovery::DiscoveryService> discovery;
     std::atomic<std::uint32_t> next_writer_key{1};
     std::atomic<std::uint32_t> next_reader_key{1};
 
@@ -110,6 +118,8 @@ public:
     [[nodiscard]] std::uint32_t domain_id() const noexcept;
     [[nodiscard]] rtps::GuidPrefix guid_prefix() const noexcept;
     [[nodiscard]] transport::Endpoint local_endpoint() const;
+    [[nodiscard]] bool discovery_enabled() const noexcept;
+    [[nodiscard]] std::size_t discovered_participant_count() const;
 
     Publisher create_publisher() const;
     Subscriber create_subscriber() const;
@@ -140,14 +150,40 @@ public:
           writer_id_(config.writer_id
               ? *config.writer_id
               : state_->allocate_writer_id()),
-          writer_(
-              *state_->transport,
-              state_->guid_prefix,
-              writer_id_,
-              std::move(config.remote_endpoint),
-              config.remote_reader_id,
-              qos_.history_depth)
+          remote_reader_id_(config.remote_reader_id),
+          discovery_timeout_(config.discovery_timeout)
     {
+        if (config.remote_endpoint.port != 0) {
+            writer_ = std::make_unique<rtps::StatelessWriter>(
+                *state_->transport,
+                state_->guid_prefix,
+                writer_id_,
+                std::move(config.remote_endpoint),
+                remote_reader_id_,
+                qos_.history_depth);
+        } else if (!state_->discovery || !state_->discovery->is_valid()) {
+            initialization_error_ =
+                "DataWriter requires a fixed remote endpoint or enabled discovery";
+        }
+
+        if (state_->discovery && state_->discovery->is_valid()) {
+            discovery::EndpointDiscoveryData endpoint;
+            endpoint.kind = discovery::DiscoveredEndpointKind::writer;
+            endpoint.endpoint_guid = {state_->guid_prefix, writer_id_};
+            endpoint.topic_name = topic_.name();
+            endpoint.type_name = topic_.type_name();
+            endpoint.reliable = qos_.reliability == ReliabilityKind::reliable;
+            state_->discovery->announce_local_endpoint(std::move(endpoint));
+            registered_with_discovery_ = true;
+        }
+    }
+
+    ~DataWriter()
+    {
+        if (registered_with_discovery_ && state_->discovery) {
+            state_->discovery->remove_local_endpoint(
+                rtps::Guid{state_->guid_prefix, writer_id_});
+        }
     }
 
     bool write(const T& value)
@@ -158,13 +194,42 @@ public:
             return false;
         }
 
+        if (!initialization_error_.empty()) {
+            last_error_ = initialization_error_;
+            return false;
+        }
+
+        if (!writer_) {
+            const auto reader = state_->discovery->wait_for_reader(
+                topic_.name(),
+                topic_.type_name(),
+                false,
+                discovery_timeout_);
+            if (!reader) {
+                last_error_ = "timed out waiting for a matching DataReader";
+                const auto discovery_error = state_->discovery->last_error();
+                if (!discovery_error.empty()) {
+                    last_error_ += ": " + discovery_error;
+                }
+                return false;
+            }
+
+            writer_ = std::make_unique<rtps::StatelessWriter>(
+                *state_->transport,
+                state_->guid_prefix,
+                writer_id_,
+                reader->unicast_locator,
+                reader->endpoint_guid.entity_id,
+                qos_.history_depth);
+        }
+
         std::vector<std::uint8_t> payload;
         if (!topic_.type_support().serialize(value, payload, last_error_)) {
             return false;
         }
 
-        if (!writer_.write(std::move(payload))) {
-            last_error_ = writer_.last_error();
+        if (!writer_->write(std::move(payload))) {
+            last_error_ = writer_->last_error();
             return false;
         }
         return true;
@@ -190,8 +255,12 @@ private:
     Topic<T> topic_;
     EndpointQos qos_;
     rtps::EntityId writer_id_;
-    rtps::StatelessWriter writer_;
+    rtps::EntityId remote_reader_id_;
+    std::chrono::milliseconds discovery_timeout_;
+    std::unique_ptr<rtps::StatelessWriter> writer_;
+    std::string initialization_error_;
     std::string last_error_;
+    bool registered_with_discovery_{false};
 };
 
 template<typename T>
@@ -209,6 +278,24 @@ public:
               : state_->allocate_reader_id()),
           reader_(*state_->transport, reader_id_, qos_.history_depth)
     {
+        if (state_->discovery && state_->discovery->is_valid()) {
+            discovery::EndpointDiscoveryData endpoint;
+            endpoint.kind = discovery::DiscoveredEndpointKind::reader;
+            endpoint.endpoint_guid = {state_->guid_prefix, reader_id_};
+            endpoint.topic_name = topic_.name();
+            endpoint.type_name = topic_.type_name();
+            endpoint.reliable = qos_.reliability == ReliabilityKind::reliable;
+            state_->discovery->announce_local_endpoint(std::move(endpoint));
+            registered_with_discovery_ = true;
+        }
+    }
+
+    ~DataReader()
+    {
+        if (registered_with_discovery_ && state_->discovery) {
+            state_->discovery->remove_local_endpoint(
+                rtps::Guid{state_->guid_prefix, reader_id_});
+        }
     }
 
     TakeResult take(T& value, std::chrono::milliseconds timeout)
@@ -273,6 +360,7 @@ private:
     EndpointQos qos_;
     rtps::EntityId reader_id_;
     rtps::StatelessReader reader_;
+    bool registered_with_discovery_{false};
 };
 
 template<typename T>

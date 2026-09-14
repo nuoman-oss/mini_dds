@@ -65,6 +65,34 @@ std::string socket_error(const std::string& operation)
 
 constexpr std::size_t max_udp_payload_size = 65507;
 
+int set_socket_option(
+    NativeSocket socket,
+    int level,
+    int option,
+    const void* value,
+    SocketLength size)
+{
+#ifdef _WIN32
+    return ::setsockopt(
+        socket,
+        level,
+        option,
+        reinterpret_cast<const char*>(value),
+        size);
+#else
+    return ::setsockopt(socket, level, option, value, size);
+#endif
+}
+
+bool parse_ipv4_address(const std::string& text, in_addr& address)
+{
+    if (text.empty() || text == "0.0.0.0") {
+        address.s_addr = htonl(INADDR_ANY);
+        return true;
+    }
+    return ::inet_pton(AF_INET, text.c_str(), &address) == 1;
+}
+
 } // namespace
 
 class UdpTransport::Impl {
@@ -111,14 +139,27 @@ UdpTransport::UdpTransport(
         return;
     }
 
+    const int reuse_address = 1;
+    if (set_socket_option(
+            impl_->socket,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &reuse_address,
+            static_cast<SocketLength>(sizeof(reuse_address))) != 0) {
+        impl_->last_error = socket_error("setsockopt(SO_REUSEADDR)");
+        close_socket(impl_->socket);
+        impl_->socket = invalid_socket;
+        return;
+    }
+
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(local_port);
 
     if (bind_address.empty() || bind_address == "0.0.0.0") {
-        address.sin_addr.s_addr = htonl(INADDR_ANY);
+        parse_ipv4_address(bind_address, address.sin_addr);
         bind_address = "0.0.0.0";
-    } else if (::inet_pton(AF_INET, bind_address.c_str(), &address.sin_addr) != 1) {
+    } else if (!parse_ipv4_address(bind_address, address.sin_addr)) {
         impl_->last_error = "invalid IPv4 bind address: " + bind_address;
         close_socket(impl_->socket);
         impl_->socket = invalid_socket;
@@ -213,6 +254,89 @@ bool UdpTransport::send(
     std::uint16_t port)
 {
     return send(data, Endpoint{address, port});
+}
+
+bool UdpTransport::join_multicast_group(
+    const std::string& group_address,
+    const std::string& interface_address)
+{
+    impl_->last_error.clear();
+    if (!is_open()) {
+        impl_->last_error = "transport is not open";
+        return false;
+    }
+
+    ip_mreq membership{};
+    if (::inet_pton(AF_INET, group_address.c_str(), &membership.imr_multiaddr) != 1 ||
+        !parse_ipv4_address(interface_address, membership.imr_interface)) {
+        impl_->last_error = "invalid IPv4 multicast group or interface address";
+        return false;
+    }
+
+    const auto first_octet = static_cast<unsigned>(
+        ntohl(membership.imr_multiaddr.s_addr) >> 24U);
+    if (first_octet < 224U || first_octet > 239U) {
+        impl_->last_error = "IPv4 multicast group must be in 224.0.0.0/4";
+        return false;
+    }
+
+    if (set_socket_option(
+            impl_->socket,
+            IPPROTO_IP,
+            IP_ADD_MEMBERSHIP,
+            &membership,
+            static_cast<SocketLength>(sizeof(membership))) != 0) {
+        impl_->last_error = socket_error("setsockopt(IP_ADD_MEMBERSHIP)");
+        return false;
+    }
+    return true;
+}
+
+bool UdpTransport::set_multicast_interface(const std::string& interface_address)
+{
+    impl_->last_error.clear();
+    if (!is_open()) {
+        impl_->last_error = "transport is not open";
+        return false;
+    }
+
+    in_addr interface{};
+    if (!parse_ipv4_address(interface_address, interface)) {
+        impl_->last_error = "invalid IPv4 multicast interface address";
+        return false;
+    }
+
+    if (set_socket_option(
+            impl_->socket,
+            IPPROTO_IP,
+            IP_MULTICAST_IF,
+            &interface,
+            static_cast<SocketLength>(sizeof(interface))) != 0) {
+        impl_->last_error = socket_error("setsockopt(IP_MULTICAST_IF)");
+        return false;
+    }
+    return true;
+}
+
+bool UdpTransport::set_multicast_loopback(bool enabled)
+{
+    impl_->last_error.clear();
+    if (!is_open()) {
+        impl_->last_error = "transport is not open";
+        return false;
+    }
+
+    const unsigned char loopback = enabled ? 1U : 0U;
+    if (set_socket_option(
+            impl_->socket,
+            IPPROTO_IP,
+            IP_MULTICAST_LOOP,
+            &loopback,
+            static_cast<SocketLength>(sizeof(loopback))) != 0) {
+        impl_->last_error = socket_error("setsockopt(IP_MULTICAST_LOOP)");
+        return false;
+    }
+    return true;
 }
 
 std::vector<std::uint8_t> UdpTransport::receive()

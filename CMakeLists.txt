@@ -2,10 +2,16 @@ cmake_minimum_required(VERSION 3.16)
 
 project(mini_dds VERSION 0.1.0 LANGUAGES CXX)
 
+find_package(Threads REQUIRED)
+
 option(MINI_DDS_BUILD_EXAMPLES "Build mini_dds examples" ON)
 
 add_library(mini_dds
     src/dds/DomainParticipant.cpp
+    src/discovery/DiscoveryData.cpp
+    src/discovery/DiscoveryService.cpp
+    src/discovery/ParameterList.cpp
+    src/discovery/PortMapping.cpp
     src/history/History.cpp
     src/rtps/Data.cpp
     src/rtps/Message.cpp
@@ -24,6 +30,7 @@ target_include_directories(mini_dds
 )
 
 target_compile_features(mini_dds PUBLIC cxx_std_17)
+target_link_libraries(mini_dds PRIVATE Threads::Threads)
 set_target_properties(mini_dds PROPERTIES CXX_EXTENSIONS OFF)
 
 if(MSVC)
