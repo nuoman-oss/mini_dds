@@ -7,16 +7,22 @@
 #include "mini_dds/history/History.h"
 #include "mini_dds/rtps/Data.h"
 #include "mini_dds/rtps/Message.h"
+#include "mini_dds/rtps/Reliability.h"
+#include "mini_dds/rtps/ReliableEndpoint.h"
 #include "mini_dds/rtps/StatelessEndpoint.h"
 #include "mini_dds/serialization/Cdr.h"
 #include "mini_dds/serialization/SerializedPayload.h"
 #include "mini_dds/transport/UDPTransport.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -32,6 +38,87 @@ void check(bool condition, const std::string& message)
         std::cerr << "FAILED: " << message << '\n';
     }
 }
+
+struct InMemoryTransportState {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::array<std::deque<mini_dds::transport::Datagram>, 2> queues;
+    bool drop_first_writer_data{false};
+    std::size_t dropped_data_count{0};
+};
+
+class InMemoryTransport final : public mini_dds::transport::ITransport {
+public:
+    InMemoryTransport(
+        std::shared_ptr<InMemoryTransportState> state,
+        std::size_t side)
+        : state_(std::move(state)),
+          side_(side),
+          local_{"memory", static_cast<std::uint16_t>(31000U + side)}
+    {
+    }
+
+    bool send(
+        const std::vector<std::uint8_t>& data,
+        const mini_dds::transport::Endpoint&) override
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (side_ == 0 && state_->drop_first_writer_data &&
+            state_->dropped_data_count == 0 &&
+            data.size() > mini_dds::rtps::message_header_size &&
+            data[mini_dds::rtps::message_header_size] ==
+                static_cast<std::uint8_t>(mini_dds::rtps::SubmessageKind::data)) {
+            ++state_->dropped_data_count;
+            return true;
+        }
+
+        state_->queues[1U - side_].push_back({data, local_});
+        state_->ready.notify_all();
+        return true;
+    }
+
+    mini_dds::transport::ReceiveResult receive(
+        std::chrono::milliseconds timeout) override
+    {
+        std::unique_lock<std::mutex> lock(state_->mutex);
+        const auto available = [this] {
+            return !state_->queues[side_].empty();
+        };
+        if (timeout.count() < 0) {
+            state_->ready.wait(lock, available);
+        } else if (!state_->ready.wait_for(lock, timeout, available)) {
+            return {mini_dds::transport::ReceiveStatus::timeout, {}, {}};
+        }
+
+        auto datagram = std::move(state_->queues[side_].front());
+        state_->queues[side_].pop_front();
+        return {
+            mini_dds::transport::ReceiveStatus::ok,
+            std::move(datagram),
+            {}};
+    }
+
+    [[nodiscard]] bool is_open() const noexcept override
+    {
+        return true;
+    }
+
+    [[nodiscard]] mini_dds::transport::Endpoint local_endpoint() const override
+    {
+        return local_;
+    }
+
+    [[nodiscard]] const std::string& last_error() const noexcept override
+    {
+        return last_error_;
+    }
+
+private:
+    std::shared_ptr<InMemoryTransportState> state_;
+    std::size_t side_;
+    mini_dds::transport::Endpoint local_;
+    std::string last_error_;
+};
 
 void test_cdr_little_endian_round_trip()
 {
@@ -222,6 +309,115 @@ void test_rtps_data_message()
         "RTPS DATA rejects simultaneous data and key flags");
 }
 
+void test_rtps_reliability_messages()
+{
+    using namespace mini_dds;
+
+    rtps::SequenceNumberSet sequence_set;
+    sequence_set.bitmap_base = {5};
+    sequence_set.num_bits = 34;
+    sequence_set.bitmap = {0x80000001U, 0x80000000U};
+    check(sequence_set.contains({5}), "SequenceNumberSet maps its first bit");
+    check(sequence_set.contains({36}), "SequenceNumberSet uses MSB-first bitmap order");
+    check(sequence_set.contains({37}), "SequenceNumberSet maps its second word");
+    check(!sequence_set.contains({6}), "SequenceNumberSet reports a clear bit");
+
+    const rtps::EntityId reader_id{{0x00, 0x00, 0x01, 0x04}};
+    const rtps::EntityId writer_id{{0x00, 0x00, 0x02, 0x03}};
+    std::vector<std::uint8_t> bytes;
+    std::string error;
+
+    rtps::HeartbeatSubmessage heartbeat;
+    heartbeat.reader_id = reader_id;
+    heartbeat.writer_id = writer_id;
+    heartbeat.first_sequence_number = {5};
+    heartbeat.last_sequence_number = {9};
+    heartbeat.count = 7;
+    heartbeat.final_flag = true;
+    check(
+        rtps::encode_heartbeat_submessage(
+            heartbeat,
+            serialization::Endianness::little,
+            bytes,
+            error),
+        "HEARTBEAT encodes: " + error);
+    check(bytes.size() == 32, "HEARTBEAT has the RTPS fixed wire size");
+    check(
+        bytes.size() >= 4 && bytes[0] == 0x07 && bytes[1] == 0x03 &&
+            bytes[2] == 0x1c && bytes[3] == 0x00,
+        "HEARTBEAT submessage header bytes");
+    rtps::HeartbeatSubmessage decoded_heartbeat;
+    check(
+        rtps::decode_heartbeat_submessage(
+            bytes.data(), bytes.size(), decoded_heartbeat, error),
+        "HEARTBEAT decodes: " + error);
+    check(
+        decoded_heartbeat.reader_id == reader_id &&
+            decoded_heartbeat.writer_id == writer_id &&
+            decoded_heartbeat.first_sequence_number.value == 5 &&
+            decoded_heartbeat.last_sequence_number.value == 9 &&
+            decoded_heartbeat.count == 7 && decoded_heartbeat.final_flag,
+        "HEARTBEAT fields round trip");
+
+    rtps::AckNackSubmessage acknack;
+    acknack.reader_id = reader_id;
+    acknack.writer_id = writer_id;
+    acknack.reader_state = sequence_set;
+    acknack.count = 11;
+    check(
+        rtps::encode_acknack_submessage(
+            acknack,
+            serialization::Endianness::big,
+            bytes,
+            error),
+        "ACKNACK encodes: " + error);
+    rtps::AckNackSubmessage decoded_acknack;
+    check(
+        rtps::decode_acknack_submessage(
+            bytes.data(), bytes.size(), decoded_acknack, error),
+        "ACKNACK decodes: " + error);
+    check(
+        decoded_acknack.reader_state.bitmap == sequence_set.bitmap &&
+            decoded_acknack.reader_state.num_bits == sequence_set.num_bits &&
+            decoded_acknack.count == acknack.count,
+        "ACKNACK fields round trip");
+
+    rtps::GapSubmessage gap;
+    gap.reader_id = reader_id;
+    gap.writer_id = writer_id;
+    gap.gap_start = {2};
+    gap.gap_list.bitmap_base = {5};
+    gap.gap_list.num_bits = 1;
+    gap.gap_list.bitmap = {0x80000000U};
+    check(
+        rtps::encode_gap_submessage(
+            gap,
+            serialization::Endianness::little,
+            bytes,
+            error),
+        "GAP encodes: " + error);
+    rtps::GapSubmessage decoded_gap;
+    check(
+        rtps::decode_gap_submessage(
+            bytes.data(), bytes.size(), decoded_gap, error),
+        "GAP decodes: " + error);
+    check(
+        decoded_gap.gap_start.value == 2 &&
+            decoded_gap.gap_list.bitmap_base.value == 5 &&
+            decoded_gap.gap_list.contains({5}),
+        "GAP fields round trip");
+
+    auto invalid = acknack;
+    invalid.reader_state.num_bits = 257;
+    check(
+        !rtps::encode_acknack_submessage(
+            invalid,
+            serialization::Endianness::little,
+            bytes,
+            error),
+        "ACKNACK rejects a bitmap larger than 256 bits");
+}
+
 void test_history_cache()
 {
     using namespace mini_dds;
@@ -299,6 +495,196 @@ void test_stateless_best_effort_path()
     }
 }
 
+void test_reliable_retransmission_path()
+{
+    using namespace mini_dds;
+
+    auto link = std::make_shared<InMemoryTransportState>();
+    link->drop_first_writer_data = true;
+    InMemoryTransport writer_transport(link, 0);
+    InMemoryTransport reader_transport(link, 1);
+
+    rtps::GuidPrefix writer_prefix;
+    writer_prefix.value = {
+        0x00, 0x00, 0x21, 0x22, 0x23, 0x24,
+        0x25, 0x26, 0x27, 0x28, 0x29, 0x2a};
+    rtps::GuidPrefix reader_prefix;
+    reader_prefix.value = {
+        0x00, 0x00, 0x31, 0x32, 0x33, 0x34,
+        0x35, 0x36, 0x37, 0x38, 0x39, 0x3a};
+    const rtps::EntityId writer_id{{0x00, 0x00, 0x02, 0x03}};
+    const rtps::EntityId reader_id{{0x00, 0x00, 0x01, 0x04}};
+
+    rtps::ReliableWriterConfig config;
+    config.acknowledgment_timeout = std::chrono::milliseconds(100);
+    config.max_retries = 3;
+    config.history_depth = 4;
+    rtps::ReliableWriter writer(
+        writer_transport,
+        writer_prefix,
+        writer_id,
+        reader_transport.local_endpoint(),
+        reader_id,
+        config);
+    rtps::ReliableReader reader(
+        reader_transport,
+        reader_prefix,
+        reader_id,
+        4);
+
+    rtps::ReaderReceiveResult reader_result;
+    std::thread reader_thread([&] {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        do {
+            reader_result = reader.receive_once(std::chrono::milliseconds(200));
+        } while (reader_result.status != rtps::ReaderReceiveStatus::sample &&
+                 reader_result.status != rtps::ReaderReceiveStatus::error &&
+                 std::chrono::steady_clock::now() < deadline);
+    });
+
+    const auto payload = serialization::serialize_string_payload("recovered sample");
+    const bool write_ok = writer.write(payload);
+    reader_thread.join();
+    check(write_ok, "ReliableWriter completes after retransmission: " + writer.last_error());
+    check(link->dropped_data_count == 1, "test transport drops the first DATA");
+    check(writer.retransmission_count() >= 1, "ReliableWriter retransmits a NACKed DATA");
+    check(
+        reader_result.status == rtps::ReaderReceiveStatus::sample,
+        "ReliableReader recovers the missing sample: " + reader_result.error);
+
+    const auto change = reader.take();
+    std::string value;
+    std::string error;
+    check(
+        change && serialization::deserialize_string_payload(
+            change->serialized_payload,
+            value,
+            error) && value == "recovered sample",
+        "reliable path restores the retransmitted payload: " + error);
+}
+
+void test_reliable_reader_ordering_and_gap()
+{
+    using namespace mini_dds;
+
+    const rtps::GuidPrefix writer_prefix{{
+        0x00, 0x00, 0x41, 0x42, 0x43, 0x44,
+        0x45, 0x46, 0x47, 0x48, 0x49, 0x4a}};
+    const rtps::GuidPrefix reader_prefix{{
+        0x00, 0x00, 0x51, 0x52, 0x53, 0x54,
+        0x55, 0x56, 0x57, 0x58, 0x59, 0x5a}};
+    const rtps::EntityId writer_id{{0x00, 0x00, 0x02, 0x03}};
+    const rtps::EntityId reader_id{{0x00, 0x00, 0x01, 0x04}};
+
+    const auto run_case = [&](bool close_gap) {
+        auto link = std::make_shared<InMemoryTransportState>();
+        InMemoryTransport sender_transport(link, 0);
+        InMemoryTransport reader_transport(link, 1);
+        rtps::ReliableReader reader(
+            reader_transport,
+            reader_prefix,
+            reader_id,
+            4);
+
+        const auto send_data = [&](std::int64_t sequence, std::uint8_t payload) {
+            rtps::DataMessage message;
+            message.header = {{2, 3}, {}, writer_prefix};
+            message.data.reader_id = reader_id;
+            message.data.writer_id = writer_id;
+            message.data.writer_sequence_number = {sequence};
+            message.data.serialized_payload = {payload};
+            std::vector<std::uint8_t> bytes;
+            std::string error;
+            return rtps::encode_data_message(
+                       message,
+                       serialization::Endianness::little,
+                       bytes,
+                       error) &&
+                   sender_transport.send(bytes, reader_transport.local_endpoint());
+        };
+
+        check(send_data(2, 0x02), "test sends out-of-order DATA(2)");
+        const auto second_first =
+            reader.receive_once(std::chrono::milliseconds(100));
+        check(
+            second_first.status == rtps::ReaderReceiveStatus::ignored,
+            "ReliableReader buffers DATA(2) while DATA(1) is missing");
+
+        if (close_gap) {
+            rtps::GapSubmessage gap;
+            gap.reader_id = reader_id;
+            gap.writer_id = writer_id;
+            gap.gap_start = {1};
+            gap.gap_list.bitmap_base = {2};
+            rtps::MessageHeader header{{2, 3}, {}, writer_prefix};
+            std::vector<std::uint8_t> bytes;
+            std::string error;
+            check(
+                rtps::encode_gap_message(
+                    header,
+                    gap,
+                    serialization::Endianness::little,
+                    bytes,
+                    error) &&
+                    sender_transport.send(bytes, reader_transport.local_endpoint()),
+                "test sends GAP(1): " + error);
+        } else {
+            check(send_data(1, 0x01), "test sends delayed DATA(1)");
+        }
+
+        const auto completed =
+            reader.receive_once(std::chrono::milliseconds(100));
+        check(
+            completed.status == rtps::ReaderReceiveStatus::sample,
+            close_gap
+                ? "GAP releases the next contiguous DATA"
+                : "delayed DATA releases samples in sequence order");
+
+        const auto first = reader.take();
+        check(
+            first && first->sequence_number.value == (close_gap ? 2 : 1),
+            close_gap
+                ? "ReaderHistory omits the irrelevant GAP sequence"
+                : "ReaderHistory exposes DATA(1) before DATA(2)");
+        if (!close_gap) {
+            const auto second = reader.take();
+            check(
+                second && second->sequence_number.value == 2,
+                "ReaderHistory exposes buffered DATA(2) second");
+        }
+    };
+
+    run_case(false);
+    run_case(true);
+}
+
+void test_reliable_writer_timeout()
+{
+    using namespace mini_dds;
+
+    auto link = std::make_shared<InMemoryTransportState>();
+    InMemoryTransport writer_transport(link, 0);
+    rtps::ReliableWriterConfig config;
+    config.acknowledgment_timeout = std::chrono::milliseconds(20);
+    config.max_retries = 1;
+    rtps::ReliableWriter writer(
+        writer_transport,
+        {},
+        {{0x00, 0x00, 0x02, 0x03}},
+        {"memory", 31001},
+        {{0x00, 0x00, 0x01, 0x04}},
+        config);
+
+    check(
+        !writer.write({0x00, 0x01, 0x00, 0x00}),
+        "ReliableWriter reports an acknowledgment timeout");
+    check(
+        writer.last_error().find("timed out") != std::string::npos &&
+            writer.retransmission_count() == 1,
+        "ReliableWriter bounds its retry count");
+}
+
 void test_dds_api_fixed_endpoint()
 {
     using namespace mini_dds;
@@ -345,13 +731,6 @@ void test_dds_api_fixed_endpoint()
         non_blocking.status == dds::TakeStatus::timeout,
         "DataReader supports a non-blocking take");
 
-    dds::DataWriterConfig reliable_config;
-    reliable_config.remote_endpoint = writer_config.remote_endpoint;
-    reliable_config.qos.reliability = dds::ReliabilityKind::reliable;
-    auto reliable_writer = publisher.create_datawriter(writer_topic, reliable_config);
-    check(
-        !reliable_writer->write("unsupported"),
-        "unsupported reliable QoS fails explicitly");
 }
 
 void test_dds_api_automatic_discovery()
@@ -396,22 +775,40 @@ void test_dds_api_automatic_discovery()
         type_support);
 
     auto subscriber = subscriber_participant.create_subscriber();
-    auto reader = subscriber.create_datareader(reader_topic);
+    dds::DataReaderConfig reader_config;
+    reader_config.qos.reliability = dds::ReliabilityKind::reliable;
+    reader_config.qos.history_depth = 4;
+    auto reader = subscriber.create_datareader(reader_topic, reader_config);
     auto publisher = publisher_participant.create_publisher();
     dds::DataWriterConfig writer_config;
     writer_config.discovery_timeout = std::chrono::seconds(3);
+    writer_config.qos.reliability = dds::ReliabilityKind::reliable;
+    writer_config.qos.history_depth = 4;
+    writer_config.qos.acknowledgment_timeout = std::chrono::milliseconds(200);
+    writer_config.qos.max_retries = 5;
     auto writer = publisher.create_datawriter(writer_topic, writer_config);
 
+    std::string sample;
+    dds::TakeResult result;
+    std::thread reader_thread([&] {
+        result = reader->take(sample, std::chrono::seconds(5));
+    });
     check(
         writer->write("automatically discovered sample"),
-        "DataWriter discovers matching DataReader: " + writer->last_error());
+        "reliable DataWriter discovers and writes to a matching DataReader: " +
+            writer->last_error());
+    reader_thread.join();
 
-    std::string sample;
-    const auto result = reader->take(sample, std::chrono::seconds(2));
-    check(result.ok(), "discovered DataReader receives sample: " + result.error);
+    check(result.ok(), "discovered reliable DataReader receives sample: " + result.error);
     check(
         sample == "automatically discovered sample",
         "automatic-discovery typed value round trip");
+    const auto discovery_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (publisher_participant.discovered_participant_count() == 0 &&
+           std::chrono::steady_clock::now() < discovery_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
     check(
         publisher_participant.discovered_participant_count() >= 1,
         "DomainParticipant exposes discovered participant count");
@@ -683,6 +1080,14 @@ void test_spdp_sedp_discovery_service()
             matched_reader->unicast_locator == config_b.user_unicast_locator,
             "SEDP reader user locator");
     }
+    check(
+        !service_a.wait_for_reader(
+             "AutoGreeting",
+             "mini_dds::String",
+             true,
+             std::chrono::milliseconds(20))
+             .has_value(),
+        "SEDP does not match Reliable Writer to Best-Effort Reader");
 
     service_b.reset();
     const auto expiry_deadline =
@@ -707,6 +1112,7 @@ int main()
     test_rtps_submessage_header();
     test_serialized_string_payload();
     test_rtps_data_message();
+    test_rtps_reliability_messages();
     test_history_cache();
     test_udp_loopback();
     test_rtps_port_mapping();
@@ -714,6 +1120,9 @@ int main()
     test_discovery_data_codecs();
     test_spdp_sedp_discovery_service();
     test_stateless_best_effort_path();
+    test_reliable_retransmission_path();
+    test_reliable_reader_ordering_and_gap();
+    test_reliable_writer_timeout();
     test_dds_api_fixed_endpoint();
     test_dds_api_automatic_discovery();
 

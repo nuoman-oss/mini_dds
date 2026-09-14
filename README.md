@@ -2,7 +2,7 @@
 
 一个用于学习 DDS、RTPS 与实时通信的轻量级 C++17 项目。
 
-当前进度：完成带自动发现的 Best-Effort MVP，包括跨平台 UDP/组播、CDR、RTPS Header/DATA、History Cache、SPDP/SEDP，以及 `DomainParticipant`、`Topic`、`Publisher/Subscriber`、`DataWriter/DataReader`。可靠传输仍在后续里程碑中。
+当前进度：完成带自动发现与最小可靠传输的 MVP，包括跨平台 UDP/组播、CDR、RTPS DATA/HEARTBEAT/ACKNACK/GAP、History Cache、SPDP/SEDP，以及 `DomainParticipant`、`Topic`、`Publisher/Subscriber`、`DataWriter/DataReader`。
 
 完整设计与进度见 [架构文档](docs/architecture.md)。
 
@@ -32,8 +32,10 @@ ctest --test-dir build --output-on-failure
 
 Windows 多配置生成器的可执行文件通常位于 `build/Debug/` 或 `build/Release/`。
 
-`publisher` 和 `subscriber` 使用 SPDP/SEDP 自动发现，不需要配置彼此的数据端口。当前示例把 `advertised_address` 设为 `127.0.0.1`；跨机器运行时需要改为对端可访问的网卡 IPv4 地址。
+`publisher` 和 `subscriber` 使用 SPDP/SEDP 自动发现与 Reliable QoS，不需要配置彼此的数据端口。当前示例把 `advertised_address` 设为 `127.0.0.1`；跨机器运行时需要改为对端可访问的网卡 IPv4 地址。
 
 `sender`/`receiver` 可用于单独验证裸 UDP 传输层。固定地址方式仍可通过 `DataWriterConfig::remote_endpoint` 使用。
 
 当前发现实现是 RTPS 发现协议的最小子集，能够让两个 mini_dds 进程互相发现，但尚不保证与第三方 DDS 实现互操作。
+
+Reliable 路径当前是单 Reader、同步确认模型：`write()` 会等待 ACKNACK，并按 `EndpointQos::acknowledgment_timeout` 与 `max_retries` 有界重传。它适合学习协议和验证丢包恢复，还不是完整 DDS 实现中的异步高吞吐可靠通道。

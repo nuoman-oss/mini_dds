@@ -15,6 +15,8 @@ add_library(mini_dds
     src/history/History.cpp
     src/rtps/Data.cpp
     src/rtps/Message.cpp
+    src/rtps/Reliability.cpp
+    src/rtps/ReliableEndpoint.cpp
     src/rtps/StatelessEndpoint.cpp
     src/serialization/Cdr.cpp
     src/serialization/SerializedPayload.cpp

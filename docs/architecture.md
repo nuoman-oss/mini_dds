@@ -10,10 +10,10 @@ mini_dds 是一个用于学习 DDS 与 RTPS 的小型实现。项目优先保证
 - 两个进程可以通过固定对端地址发布和订阅一个 Topic；
 - 使用 CDR 序列化应用数据；
 - 使用 RTPS Message Header 与 DATA Submessage 承载数据；
-- 首个版本采用 Best-Effort，不保证丢包重传；
+- 同时提供 Best-Effort 与单 Reader、同步确认的最小 Reliable 路径；
 - 每个协议组件都有独立的编解码测试。
 
-后续版本再增加自动发现、可靠传输、QoS 和第三方 DDS 互操作。
+后续版本继续增加异步一对多可靠传输、更多 QoS 和第三方 DDS 互操作。
 
 ## 2. 当前范围与非目标
 
@@ -132,7 +132,7 @@ DDS 层负责对象生命周期与配置，网络协议细节不能泄漏到应�
 - History：KeepLast；
 - Durability：Volatile。
 
-在 Best-Effort 路径稳定之前不实现 Reliable，避免状态机与基础数据面同时调试。
+实现顺序先稳定 Best-Effort 数据面，再在相同传输与 History 边界上叠加 Reliable 状态机。
 
 ## 5. 目录规划
 
@@ -189,10 +189,10 @@ UDP datagram
 
 MVP 使用简单且可控的线程模型：
 
-- 一个接收线程负责 UDP 收包；
-- 一个事件循环解析消息并分发给 Reader；
-- 用户线程调用 `write()`；
-- 回调不在持有内部锁时执行；
+- SPDP/SEDP 服务拥有独立的公告与接收线程；
+- 用户数据由调用 `DataReader::take()` 的线程同步收包和解析；
+- Best-Effort `write()` 只负责发送，Reliable `write()` 同步等待 ACKNACK；
+- 当前没有用户回调线程，样本统一通过 `take()` 取出；
 - 停止时通过有限接收超时退出，不依赖强制终止线程。
 
 后续性能优化可以引入任务队列，但不改变模块边界。
@@ -273,7 +273,7 @@ MVP 使用简单且可控的线程模型：
 
 - 一个 Participant 暂时只应有一个主动收包的 DataReader；
 - Writer 可以使用固定远端，也可以通过 SEDP 自动匹配，但暂时只发送给第一个匹配 Reader；
-- Reliable QoS 会明确返回“不支持”，不会静默降级。
+- Best-Effort 与 Reliable 均已接入统一的 `DataWriter`/`DataReader` API。
 
 ### M4：自动发现（已完成最小版本）
 
@@ -291,12 +291,25 @@ MVP 使用简单且可控的线程模型：
 - 同一 Writer 暂时只选择第一个匹配 Reader，尚未实现一对多 fan-out；
 - 使用未分配的实验 VendorId，因此不宣称第三方互操作。
 
-### M5：可靠性与 QoS
+### M5：可靠性与 QoS（已完成最小版本）
 
-- [ ] HEARTBEAT、ACKNACK、GAP；
-- [ ] Reliable Writer/Reader 状态机；
-- [ ] 超时与重传；
-- [ ] KeepLast、Volatile 等最小 QoS。
+- [x] `SequenceNumberSet` 与 HEARTBEAT、ACKNACK、GAP 编解码；
+- [x] Reliable Writer/Reader 状态机；
+- [x] ACK 超时、缺口反馈与有界重传；
+- [x] KeepLast、Volatile 最小 QoS；
+- [x] SEDP 可靠性匹配；
+- [x] 首包丢失恢复、确认超时与双进程集成测试。
+
+当前 Reliable 实现采用同步 stop-and-wait 模型：`write()` 发送 DATA 与 HEARTBEAT，等待匹配 Reader 的 ACKNACK；收到 NACK 或确认超时后，在 `max_retries` 范围内重传。Reader 会缓存乱序 DATA，只把连续序列交给 ReaderHistory。
+
+当前 M5 限制：
+
+- 一个 Writer 只维护一个匹配 Reader 的确认状态，尚无一对多可靠 fan-out；
+- SEDP 当前要求 Writer/Reader 可靠性精确相等，尚未实现完整的 requested/offered QoS 兼容规则；
+- 没有后台 HEARTBEAT 定时器，可靠写入会同步等待确认；
+- GAP 已支持编解码和 Reader 处理，但 Writer 尚未为已淘汰样本主动生成 GAP；
+- History 目前只有 KeepLast，Durability 目前只有 Volatile；
+- 尚未实现 DATA_FRAG、HEARTBEAT_FRAG 与 NACK_FRAG。
 
 ## 12. 完成定义
 

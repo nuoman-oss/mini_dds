@@ -486,7 +486,7 @@ public:
                 return endpoint.data.kind == DiscoveredEndpointKind::reader &&
                        endpoint.data.topic_name == topic_name &&
                        endpoint.data.type_name == type_name &&
-                       (writer_is_reliable || !endpoint.data.reliable);
+                       endpoint.data.reliable == writer_is_reliable;
             });
         return match == remote_endpoints.end()
             ? std::nullopt

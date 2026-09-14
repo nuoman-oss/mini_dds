@@ -28,7 +28,10 @@ int main()
         "HelloWorld",
         type_support);
     const auto subscriber = participant.create_subscriber();
-    auto reader = subscriber.create_datareader(topic);
+    DataReaderConfig reader_config;
+    reader_config.qos.reliability = ReliabilityKind::reliable;
+    reader_config.qos.history_depth = 8;
+    auto reader = subscriber.create_datareader(topic, reader_config);
 
     std::cout << "waiting for Topic '" << topic.name()
               << "' with automatic discovery\n";

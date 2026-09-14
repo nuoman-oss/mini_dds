@@ -3,6 +3,7 @@
 #include "mini_dds/dds/Qos.h"
 #include "mini_dds/dds/Topic.h"
 #include "mini_dds/discovery/DiscoveryService.h"
+#include "mini_dds/rtps/ReliableEndpoint.h"
 #include "mini_dds/rtps/StatelessEndpoint.h"
 #include "mini_dds/transport/UDPTransport.h"
 
@@ -154,13 +155,7 @@ public:
           discovery_timeout_(config.discovery_timeout)
     {
         if (config.remote_endpoint.port != 0) {
-            writer_ = std::make_unique<rtps::StatelessWriter>(
-                *state_->transport,
-                state_->guid_prefix,
-                writer_id_,
-                std::move(config.remote_endpoint),
-                remote_reader_id_,
-                qos_.history_depth);
+            create_writer(std::move(config.remote_endpoint), remote_reader_id_);
         } else if (!state_->discovery || !state_->discovery->is_valid()) {
             initialization_error_ =
                 "DataWriter requires a fixed remote endpoint or enabled discovery";
@@ -189,21 +184,16 @@ public:
     bool write(const T& value)
     {
         last_error_.clear();
-        if (qos_.reliability != ReliabilityKind::best_effort) {
-            last_error_ = "reliable DataWriter is not implemented";
-            return false;
-        }
-
         if (!initialization_error_.empty()) {
             last_error_ = initialization_error_;
             return false;
         }
 
-        if (!writer_) {
+        if (!best_effort_writer_ && !reliable_writer_) {
             const auto reader = state_->discovery->wait_for_reader(
                 topic_.name(),
                 topic_.type_name(),
-                false,
+                qos_.reliability == ReliabilityKind::reliable,
                 discovery_timeout_);
             if (!reader) {
                 last_error_ = "timed out waiting for a matching DataReader";
@@ -214,13 +204,9 @@ public:
                 return false;
             }
 
-            writer_ = std::make_unique<rtps::StatelessWriter>(
-                *state_->transport,
-                state_->guid_prefix,
-                writer_id_,
+            create_writer(
                 reader->unicast_locator,
-                reader->endpoint_guid.entity_id,
-                qos_.history_depth);
+                reader->endpoint_guid.entity_id);
         }
 
         std::vector<std::uint8_t> payload;
@@ -228,9 +214,16 @@ public:
             return false;
         }
 
-        if (!writer_->write(std::move(payload))) {
-            last_error_ = writer_->last_error();
-            return false;
+        if (reliable_writer_) {
+            if (!reliable_writer_->write(std::move(payload))) {
+                last_error_ = reliable_writer_->last_error();
+                return false;
+            }
+        } else {
+            if (!best_effort_writer_->write(std::move(payload))) {
+                last_error_ = best_effort_writer_->last_error();
+                return false;
+            }
         }
         return true;
     }
@@ -251,13 +244,41 @@ public:
     }
 
 private:
+    void create_writer(
+        transport::Endpoint remote_endpoint,
+        rtps::EntityId remote_reader_id)
+    {
+        if (qos_.reliability == ReliabilityKind::reliable) {
+            rtps::ReliableWriterConfig reliable_config;
+            reliable_config.acknowledgment_timeout = qos_.acknowledgment_timeout;
+            reliable_config.max_retries = qos_.max_retries;
+            reliable_config.history_depth = qos_.history_depth;
+            reliable_writer_ = std::make_unique<rtps::ReliableWriter>(
+                *state_->transport,
+                state_->guid_prefix,
+                writer_id_,
+                std::move(remote_endpoint),
+                remote_reader_id,
+                reliable_config);
+        } else {
+            best_effort_writer_ = std::make_unique<rtps::StatelessWriter>(
+                *state_->transport,
+                state_->guid_prefix,
+                writer_id_,
+                std::move(remote_endpoint),
+                remote_reader_id,
+                qos_.history_depth);
+        }
+    }
+
     std::shared_ptr<detail::ParticipantState> state_;
     Topic<T> topic_;
     EndpointQos qos_;
     rtps::EntityId writer_id_;
     rtps::EntityId remote_reader_id_;
     std::chrono::milliseconds discovery_timeout_;
-    std::unique_ptr<rtps::StatelessWriter> writer_;
+    std::unique_ptr<rtps::StatelessWriter> best_effort_writer_;
+    std::unique_ptr<rtps::ReliableWriter> reliable_writer_;
     std::string initialization_error_;
     std::string last_error_;
     bool registered_with_discovery_{false};
@@ -275,9 +296,21 @@ public:
           qos_(config.qos),
           reader_id_(config.reader_id
               ? *config.reader_id
-              : state_->allocate_reader_id()),
-          reader_(*state_->transport, reader_id_, qos_.history_depth)
+              : state_->allocate_reader_id())
     {
+        if (qos_.reliability == ReliabilityKind::reliable) {
+            reliable_reader_ = std::make_unique<rtps::ReliableReader>(
+                *state_->transport,
+                state_->guid_prefix,
+                reader_id_,
+                qos_.history_depth);
+        } else {
+            best_effort_reader_ = std::make_unique<rtps::StatelessReader>(
+                *state_->transport,
+                reader_id_,
+                qos_.history_depth);
+        }
+
         if (state_->discovery && state_->discovery->is_valid()) {
             discovery::EndpointDiscoveryData endpoint;
             endpoint.kind = discovery::DiscoveredEndpointKind::reader;
@@ -300,17 +333,16 @@ public:
 
     TakeResult take(T& value, std::chrono::milliseconds timeout)
     {
-        if (qos_.reliability != ReliabilityKind::best_effort) {
-            return TakeResult{TakeStatus::error, "reliable DataReader is not implemented"};
-        }
-
         const bool wait_forever = timeout.count() < 0;
         const auto deadline = std::chrono::steady_clock::now() +
             (wait_forever ? std::chrono::milliseconds(0) : timeout);
         bool attempted_receive = false;
 
         while (true) {
-            if (auto cached = reader_.take()) {
+            auto cached = reliable_reader_
+                ? reliable_reader_->take()
+                : best_effort_reader_->take();
+            if (cached) {
                 std::string error;
                 if (!topic_.type_support().deserialize(
                         cached->serialized_payload,
@@ -333,7 +365,9 @@ public:
                           deadline - now);
             }
 
-            const auto receive_result = reader_.receive_once(remaining);
+            const auto receive_result = reliable_reader_
+                ? reliable_reader_->receive_once(remaining)
+                : best_effort_reader_->receive_once(remaining);
             attempted_receive = true;
             if (receive_result.status == rtps::ReaderReceiveStatus::timeout) {
                 return TakeResult{TakeStatus::timeout, {}};
@@ -359,7 +393,8 @@ private:
     Topic<T> topic_;
     EndpointQos qos_;
     rtps::EntityId reader_id_;
-    rtps::StatelessReader reader_;
+    std::unique_ptr<rtps::StatelessReader> best_effort_reader_;
+    std::unique_ptr<rtps::ReliableReader> reliable_reader_;
     bool registered_with_discovery_{false};
 };
 

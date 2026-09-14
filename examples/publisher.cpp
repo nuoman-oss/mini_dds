@@ -32,6 +32,9 @@ int main()
 
     DataWriterConfig writer_config;
     writer_config.discovery_timeout = std::chrono::seconds(5);
+    writer_config.qos.reliability = ReliabilityKind::reliable;
+    writer_config.qos.history_depth = 8;
+    writer_config.qos.max_retries = 10;
     auto writer = publisher.create_datawriter(topic, writer_config);
 
     for (int index = 1; index <= 5; ++index) {
