@@ -2,7 +2,7 @@
 
 一个用于学习 DDS、RTPS 与实时通信的轻量级 C++17 项目。
 
-当前进度：完成带自动发现与最小可靠传输的 MVP，包括跨平台 UDP/组播、CDR、RTPS DATA/HEARTBEAT/ACKNACK/GAP、History Cache、SPDP/SEDP，以及 `DomainParticipant`、`Topic`、`Publisher/Subscriber`、`DataWriter/DataReader`。
+当前进度：完成带自动发现、Best-Effort/可靠一对多发布的 MVP，包括跨平台 UDP/组播、CDR、RTPS DATA/HEARTBEAT/ACKNACK/GAP、History Cache、SPDP/SEDP，以及 `DomainParticipant`、`Topic`、`Publisher/Subscriber`、`DataWriter/DataReader`。
 
 完整设计与进度见 [架构文档](docs/architecture.md)。
 
@@ -38,4 +38,4 @@ Windows 多配置生成器的可执行文件通常位于 `build/Debug/` 或 `bui
 
 当前发现实现是 RTPS 发现协议的最小子集，能够让两个 mini_dds 进程互相发现，但尚不保证与第三方 DDS 实现互操作。
 
-Reliable 路径当前是单 Reader、同步确认模型：`write()` 会等待 ACKNACK，并按 `EndpointQos::acknowledgment_timeout` 与 `max_retries` 有界重传。它适合学习协议和验证丢包恢复，还不是完整 DDS 实现中的异步高吞吐可靠通道。
+Reliable 路径当前是多 Reader、逐 Reader 同步确认模型：`write()` 会等待所有匹配 Reader 的 ACKNACK，并仅对未确认 Reader 按 `EndpointQos::acknowledgment_timeout` 与 `max_retries` 有界重传。它适合学习协议和验证一对多丢包恢复，还不是完整 DDS 实现中的异步高吞吐可靠通道。

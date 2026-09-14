@@ -1,5 +1,6 @@
 #include "mini_dds/rtps/StatelessEndpoint.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace mini_dds::rtps {
@@ -8,6 +9,18 @@ namespace {
 bool is_unknown_entity(const EntityId& entity_id)
 {
     return entity_id == EntityId{};
+}
+
+std::vector<ReaderProxy> unique_readers(std::vector<ReaderProxy> readers)
+{
+    std::vector<ReaderProxy> result;
+    result.reserve(readers.size());
+    for (auto& reader : readers) {
+        if (std::find(result.begin(), result.end(), reader) == result.end()) {
+            result.push_back(std::move(reader));
+        }
+    }
+    return result;
 }
 
 } // namespace
@@ -19,11 +32,25 @@ StatelessWriter::StatelessWriter(
     transport::Endpoint remote_endpoint,
     EntityId reader_id,
     std::size_t history_depth)
+    : StatelessWriter(
+          transport,
+          participant_prefix,
+          writer_id,
+          std::vector<ReaderProxy>{{std::move(remote_endpoint), reader_id}},
+          history_depth)
+{
+}
+
+StatelessWriter::StatelessWriter(
+    transport::ITransport& transport,
+    GuidPrefix participant_prefix,
+    EntityId writer_id,
+    std::vector<ReaderProxy> readers,
+    std::size_t history_depth)
     : transport_(transport),
       message_header_{ProtocolVersion{2, 3}, VendorId{}, participant_prefix},
       writer_id_(writer_id),
-      reader_id_(reader_id),
-      remote_endpoint_(std::move(remote_endpoint)),
+      readers_(unique_readers(std::move(readers))),
       history_(Guid{participant_prefix, writer_id}, history_depth)
 {
 }
@@ -31,31 +58,42 @@ StatelessWriter::StatelessWriter(
 bool StatelessWriter::write(std::vector<std::uint8_t> serialized_payload)
 {
     last_error_.clear();
-    const auto change = history_.add(std::move(serialized_payload));
-
-    const DataMessage message{
-        message_header_,
-        DataSubmessage{
-            reader_id_,
-            writer_id_,
-            change.sequence_number,
-            change.serialized_payload}};
-
-    std::vector<std::uint8_t> bytes;
-    if (!encode_data_message(
-            message,
-            serialization::Endianness::little,
-            bytes,
-            last_error_)) {
+    if (readers_.empty()) {
+        last_error_ = "StatelessWriter has no matched readers";
         return false;
     }
+    const auto change = history_.add(std::move(serialized_payload));
 
-    if (!transport_.send(bytes, remote_endpoint_)) {
-        last_error_ = transport_.last_error();
-        return false;
+    for (const auto& reader : readers_) {
+        const DataMessage message{
+            message_header_,
+            DataSubmessage{
+                reader.reader_id,
+                writer_id_,
+                change.sequence_number,
+                change.serialized_payload}};
+
+        std::vector<std::uint8_t> bytes;
+        if (!encode_data_message(
+                message,
+                serialization::Endianness::little,
+                bytes,
+                last_error_)) {
+            return false;
+        }
+
+        if (!transport_.send(bytes, reader.endpoint)) {
+            last_error_ = transport_.last_error();
+            return false;
+        }
     }
 
     return true;
+}
+
+void StatelessWriter::set_readers(std::vector<ReaderProxy> readers)
+{
+    readers_ = unique_readers(std::move(readers));
 }
 
 const std::string& StatelessWriter::last_error() const noexcept
@@ -66,6 +104,11 @@ const std::string& StatelessWriter::last_error() const noexcept
 const history::WriterHistory& StatelessWriter::history() const noexcept
 {
     return history_;
+}
+
+std::size_t StatelessWriter::matched_reader_count() const noexcept
+{
+    return readers_.size();
 }
 
 StatelessReader::StatelessReader(

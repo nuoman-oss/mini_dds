@@ -13,6 +13,16 @@
 
 namespace mini_dds::rtps {
 
+struct ReaderProxy {
+    transport::Endpoint endpoint;
+    EntityId reader_id;
+};
+
+inline bool operator==(const ReaderProxy& lhs, const ReaderProxy& rhs)
+{
+    return lhs.endpoint == rhs.endpoint && lhs.reader_id == rhs.reader_id;
+}
+
 class StatelessWriter {
 public:
     StatelessWriter(
@@ -23,17 +33,25 @@ public:
         EntityId reader_id = {},
         std::size_t history_depth = 1);
 
+    StatelessWriter(
+        transport::ITransport& transport,
+        GuidPrefix participant_prefix,
+        EntityId writer_id,
+        std::vector<ReaderProxy> readers,
+        std::size_t history_depth = 1);
+
     bool write(std::vector<std::uint8_t> serialized_payload);
+    void set_readers(std::vector<ReaderProxy> readers);
 
     [[nodiscard]] const std::string& last_error() const noexcept;
     [[nodiscard]] const history::WriterHistory& history() const noexcept;
+    [[nodiscard]] std::size_t matched_reader_count() const noexcept;
 
 private:
     transport::ITransport& transport_;
     MessageHeader message_header_;
     EntityId writer_id_;
-    EntityId reader_id_;
-    transport::Endpoint remote_endpoint_;
+    std::vector<ReaderProxy> readers_;
     history::WriterHistory history_;
     std::string last_error_;
 };

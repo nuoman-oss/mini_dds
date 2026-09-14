@@ -43,6 +43,28 @@ bool acknack_has_requests(const AckNackSubmessage& acknack)
         [](std::uint32_t word) { return word != 0; });
 }
 
+std::vector<ReaderProxy> unique_readers(std::vector<ReaderProxy> readers)
+{
+    std::vector<ReaderProxy> result;
+    result.reserve(readers.size());
+    for (auto& reader : readers) {
+        if (std::find(result.begin(), result.end(), reader) == result.end()) {
+            result.push_back(std::move(reader));
+        }
+    }
+    return result;
+}
+
+bool acknack_matches_reader(
+    const AckNackSubmessage& acknack,
+    const transport::Endpoint& source,
+    const ReaderProxy& reader)
+{
+    return source == reader.endpoint &&
+           (is_unknown_entity(reader.reader_id) ||
+            targets_entity(acknack.reader_id, reader.reader_id));
+}
+
 } // namespace
 
 ReliableWriter::ReliableWriter(
@@ -52,11 +74,25 @@ ReliableWriter::ReliableWriter(
     transport::Endpoint remote_endpoint,
     EntityId reader_id,
     ReliableWriterConfig config)
+    : ReliableWriter(
+          transport,
+          participant_prefix,
+          writer_id,
+          std::vector<ReaderProxy>{{std::move(remote_endpoint), reader_id}},
+          config)
+{
+}
+
+ReliableWriter::ReliableWriter(
+    transport::ITransport& transport,
+    GuidPrefix participant_prefix,
+    EntityId writer_id,
+    std::vector<ReaderProxy> readers,
+    ReliableWriterConfig config)
     : transport_(transport),
       message_header_{ProtocolVersion{2, 3}, VendorId{}, participant_prefix},
       writer_id_(writer_id),
-      reader_id_(reader_id),
-      remote_endpoint_(std::move(remote_endpoint)),
+      readers_(unique_readers(std::move(readers))),
       config_(config),
       history_(Guid{participant_prefix, writer_id}, config.history_depth)
 {
@@ -65,12 +101,14 @@ ReliableWriter::ReliableWriter(
     }
 }
 
-bool ReliableWriter::send_change(const history::CacheChange& change)
+bool ReliableWriter::send_change(
+    const history::CacheChange& change,
+    const ReaderProxy& reader)
 {
     const DataMessage message{
         message_header_,
         DataSubmessage{
-            reader_id_,
+            reader.reader_id,
             writer_id_,
             change.sequence_number,
             change.serialized_payload}};
@@ -83,20 +121,22 @@ bool ReliableWriter::send_change(const history::CacheChange& change)
             last_error_)) {
         return false;
     }
-    if (!transport_.send(bytes, remote_endpoint_)) {
+    if (!transport_.send(bytes, reader.endpoint)) {
         last_error_ = transport_.last_error();
         return false;
     }
     return true;
 }
 
-bool ReliableWriter::send_heartbeat(SequenceNumber sequence_number)
+bool ReliableWriter::send_heartbeat(
+    SequenceNumber sequence_number,
+    const ReaderProxy& reader)
 {
     if (heartbeat_count_ == std::numeric_limits<std::int32_t>::max()) {
         heartbeat_count_ = 0;
     }
     HeartbeatSubmessage heartbeat;
-    heartbeat.reader_id = reader_id_;
+    heartbeat.reader_id = reader.reader_id;
     heartbeat.writer_id = writer_id_;
     heartbeat.first_sequence_number = sequence_number;
     heartbeat.last_sequence_number = sequence_number;
@@ -111,7 +151,7 @@ bool ReliableWriter::send_heartbeat(SequenceNumber sequence_number)
             last_error_)) {
         return false;
     }
-    if (!transport_.send(bytes, remote_endpoint_)) {
+    if (!transport_.send(bytes, reader.endpoint)) {
         last_error_ = transport_.last_error();
         return false;
     }
@@ -121,15 +161,54 @@ bool ReliableWriter::send_heartbeat(SequenceNumber sequence_number)
 bool ReliableWriter::write(std::vector<std::uint8_t> serialized_payload)
 {
     last_error_.clear();
+    if (readers_.empty()) {
+        last_error_ = "ReliableWriter has no matched readers";
+        return false;
+    }
     const auto change = history_.add(std::move(serialized_payload));
+
+    struct ReaderWriteState {
+        ReaderProxy reader;
+        bool acknowledged{false};
+        bool retry_requested{false};
+    };
+    std::vector<ReaderWriteState> states;
+    states.reserve(readers_.size());
+    for (const auto& reader : readers_) {
+        states.push_back(ReaderWriteState{reader});
+    }
+
+    const auto all_acknowledged = [&states] {
+        return std::all_of(
+            states.begin(),
+            states.end(),
+            [](const ReaderWriteState& state) {
+                return state.acknowledged;
+            });
+    };
+    const auto every_pending_reader_requested_retry = [&states] {
+        return std::all_of(
+            states.begin(),
+            states.end(),
+            [](const ReaderWriteState& state) {
+                return state.acknowledged || state.retry_requested;
+            });
+    };
 
     std::size_t attempt = 0;
     while (true) {
-        if (attempt != 0) {
-            ++retransmission_count_;
-        }
-        if (!send_change(change) || !send_heartbeat(change.sequence_number)) {
-            return false;
+        for (auto& state : states) {
+            if (state.acknowledged) {
+                continue;
+            }
+            state.retry_requested = false;
+            if (attempt != 0) {
+                ++retransmission_count_;
+            }
+            if (!send_change(change, state.reader) ||
+                !send_heartbeat(change.sequence_number, state.reader)) {
+                return false;
+            }
         }
 
         const auto deadline =
@@ -148,9 +227,6 @@ bool ReliableWriter::write(std::vector<std::uint8_t> serialized_payload)
             if (!received.ok()) {
                 last_error_ = received.error;
                 return false;
-            }
-            if (received.datagram.source != remote_endpoint_) {
-                continue;
             }
 
             MessageHeader header;
@@ -180,17 +256,40 @@ bool ReliableWriter::write(std::vector<std::uint8_t> serialized_payload)
                     acknack,
                     decode_error) ||
                 !(acknack.writer_id == writer_id_) ||
-                (!is_unknown_entity(reader_id_) &&
-                 !targets_entity(acknack.reader_id, reader_id_))) {
+                is_unknown_entity(acknack.reader_id)) {
+                continue;
+            }
+
+            const auto state = std::find_if(
+                states.begin(),
+                states.end(),
+                [&](const ReaderWriteState& current) {
+                    return !current.acknowledged &&
+                           acknack_matches_reader(
+                               acknack,
+                               received.datagram.source,
+                               current.reader);
+                });
+            if (state == states.end()) {
                 continue;
             }
             if (acknack_acknowledges(acknack, change.sequence_number) &&
                 !acknack_has_requests(acknack)) {
-                return true;
+                state->acknowledged = true;
+                if (all_acknowledged()) {
+                    return true;
+                }
             }
             if (acknack.reader_state.contains(change.sequence_number)) {
+                state->retry_requested = true;
+            }
+            if (every_pending_reader_requested_retry()) {
                 break;
             }
+        }
+
+        if (all_acknowledged()) {
+            return true;
         }
 
         if (attempt == config_.max_retries) {
@@ -199,9 +298,20 @@ bool ReliableWriter::write(std::vector<std::uint8_t> serialized_payload)
         ++attempt;
     }
 
-    last_error_ = "timed out waiting for ACKNACK after the initial transmission and " +
+    const auto pending_count = static_cast<std::size_t>(std::count_if(
+        states.begin(),
+        states.end(),
+        [](const ReaderWriteState& state) { return !state.acknowledged; }));
+    last_error_ = "timed out waiting for ACKNACK from " +
+        std::to_string(pending_count) +
+        " reader(s) after the initial transmission and " +
         std::to_string(config_.max_retries) + " retries";
     return false;
+}
+
+void ReliableWriter::set_readers(std::vector<ReaderProxy> readers)
+{
+    readers_ = unique_readers(std::move(readers));
 }
 
 const std::string& ReliableWriter::last_error() const noexcept
@@ -217,6 +327,11 @@ const history::WriterHistory& ReliableWriter::history() const noexcept
 std::size_t ReliableWriter::retransmission_count() const noexcept
 {
     return retransmission_count_;
+}
+
+std::size_t ReliableWriter::matched_reader_count() const noexcept
+{
+    return readers_.size();
 }
 
 ReliableReader::ReliableReader(

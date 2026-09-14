@@ -10,10 +10,10 @@ mini_dds 是一个用于学习 DDS 与 RTPS 的小型实现。项目优先保证
 - 两个进程可以通过固定对端地址发布和订阅一个 Topic；
 - 使用 CDR 序列化应用数据；
 - 使用 RTPS Message Header 与 DATA Submessage 承载数据；
-- 同时提供 Best-Effort 与单 Reader、同步确认的最小 Reliable 路径；
+- 同时提供 Best-Effort 与同步确认的最小 Reliable 路径；
 - 每个协议组件都有独立的编解码测试。
 
-后续版本继续增加异步一对多可靠传输、更多 QoS 和第三方 DDS 互操作。
+后续版本继续增加异步可靠传输、更多 QoS 和第三方 DDS 互操作。
 
 ## 2. 当前范围与非目标
 
@@ -26,7 +26,7 @@ mini_dds 是一个用于学习 DDS 与 RTPS 的小型实现。项目优先保证
 - 固定对端发布/订阅；
 - Best-Effort DataWriter/DataReader；
 - SPDP/SEDP 自动发现；
-- 最小 Reliable Writer/Reader。
+- Best-Effort 与最小 Reliable 一对多 Writer/Reader。
 
 ### 2.2 暂不实现
 
@@ -272,7 +272,7 @@ MVP 使用简单且可控的线程模型：
 当前 M3 有意保留以下限制：
 
 - 一个 Participant 暂时只应有一个主动收包的 DataReader；
-- Writer 可以使用固定远端，也可以通过 SEDP 自动匹配，但暂时只发送给第一个匹配 Reader；
+- Writer 可以使用固定远端，也可以通过 SEDP 自动匹配全部同 Topic、同类型 Reader；
 - Best-Effort 与 Reliable 均已接入统一的 `DataWriter`/`DataReader` API。
 
 ### M4：自动发现（已完成最小版本）
@@ -288,7 +288,6 @@ MVP 使用简单且可控的线程模型：
 - SEDP 尚未使用 Reliable 内建端点状态机，而是通过周期性重复公告提高容错；
 - 尚未处理第三方实现常用的复合 Submessage、更多 PID 和兼容性规则；
 - Endpoint 删除尚未发送 dispose，远端记录会随 Participant 租约清理；
-- 同一 Writer 暂时只选择第一个匹配 Reader，尚未实现一对多 fan-out；
 - 使用未分配的实验 VendorId，因此不宣称第三方互操作。
 
 ### M5：可靠性与 QoS（已完成最小版本）
@@ -300,16 +299,25 @@ MVP 使用简单且可控的线程模型：
 - [x] SEDP 可靠性匹配；
 - [x] 首包丢失恢复、确认超时与双进程集成测试。
 
-当前 Reliable 实现采用同步 stop-and-wait 模型：`write()` 发送 DATA 与 HEARTBEAT，等待匹配 Reader 的 ACKNACK；收到 NACK 或确认超时后，在 `max_retries` 范围内重传。Reader 会缓存乱序 DATA，只把连续序列交给 ReaderHistory。
+当前 Reliable 实现采用同步 stop-and-wait 模型：`write()` 向全部匹配 Reader 发送 DATA 与 HEARTBEAT，分别记录每个 Reader 的 ACKNACK；收到 NACK 或确认超时后，只向尚未确认的 Reader 在 `max_retries` 范围内重传。Reader 会缓存乱序 DATA，只把连续序列交给 ReaderHistory。
 
 当前 M5 限制：
 
-- 一个 Writer 只维护一个匹配 Reader 的确认状态，尚无一对多可靠 fan-out；
 - SEDP 当前要求 Writer/Reader 可靠性精确相等，尚未实现完整的 requested/offered QoS 兼容规则；
 - 没有后台 HEARTBEAT 定时器，可靠写入会同步等待确认；
 - GAP 已支持编解码和 Reader 处理，但 Writer 尚未为已淘汰样本主动生成 GAP；
 - History 目前只有 KeepLast，Durability 目前只有 Volatile；
 - 尚未实现 DATA_FRAG、HEARTBEAT_FRAG 与 NACK_FRAG。
+
+### M6：一对多发布（已完成最小版本）
+
+- [x] Discovery 返回全部匹配 Reader，并在每次写入前刷新匹配集合；
+- [x] Best-Effort Writer 将同一 CacheChange fan-out 给全部 Reader；
+- [x] Reliable Writer 维护逐 Reader 确认状态；
+- [x] 已确认 Reader 不参与其他 Reader 触发的重传；
+- [x] 双 Reader 自动发现与选择性丢包集成测试。
+
+当前 M6 仍保留同步写入语义；新加入或租约过期的 Reader 会在下一次 `write()` 刷新时加入或移出匹配集合。
 
 ## 12. 完成定义
 

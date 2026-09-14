@@ -32,21 +32,33 @@ public:
         EntityId reader_id,
         ReliableWriterConfig config = {});
 
+    ReliableWriter(
+        transport::ITransport& transport,
+        GuidPrefix participant_prefix,
+        EntityId writer_id,
+        std::vector<ReaderProxy> readers,
+        ReliableWriterConfig config = {});
+
     bool write(std::vector<std::uint8_t> serialized_payload);
+    void set_readers(std::vector<ReaderProxy> readers);
 
     [[nodiscard]] const std::string& last_error() const noexcept;
     [[nodiscard]] const history::WriterHistory& history() const noexcept;
     [[nodiscard]] std::size_t retransmission_count() const noexcept;
+    [[nodiscard]] std::size_t matched_reader_count() const noexcept;
 
 private:
-    bool send_change(const history::CacheChange& change);
-    bool send_heartbeat(SequenceNumber sequence_number);
+    bool send_change(
+        const history::CacheChange& change,
+        const ReaderProxy& reader);
+    bool send_heartbeat(
+        SequenceNumber sequence_number,
+        const ReaderProxy& reader);
 
     transport::ITransport& transport_;
     MessageHeader message_header_;
     EntityId writer_id_;
-    EntityId reader_id_;
-    transport::Endpoint remote_endpoint_;
+    std::vector<ReaderProxy> readers_;
     ReliableWriterConfig config_;
     history::WriterHistory history_;
     std::int32_t heartbeat_count_{0};

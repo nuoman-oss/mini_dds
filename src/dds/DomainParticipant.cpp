@@ -131,6 +131,13 @@ std::size_t DomainParticipant::discovered_participant_count() const
         : 0;
 }
 
+std::size_t DomainParticipant::discovered_endpoint_count() const
+{
+    return state_->discovery
+        ? state_->discovery->remote_endpoint_count()
+        : 0;
+}
+
 Publisher DomainParticipant::create_publisher() const
 {
     return Publisher(state_);

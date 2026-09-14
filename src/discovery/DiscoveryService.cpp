@@ -474,23 +474,21 @@ public:
             local_endpoints.end());
     }
 
-    std::optional<EndpointDiscoveryData> find_reader(
+    std::vector<EndpointDiscoveryData> find_readers(
         const std::string& topic_name,
         const std::string& type_name,
         bool writer_is_reliable) const
     {
-        const auto match = std::find_if(
-            remote_endpoints.begin(),
-            remote_endpoints.end(),
-            [&](const RemoteEndpoint& endpoint) {
-                return endpoint.data.kind == DiscoveredEndpointKind::reader &&
-                       endpoint.data.topic_name == topic_name &&
-                       endpoint.data.type_name == type_name &&
-                       endpoint.data.reliable == writer_is_reliable;
-            });
-        return match == remote_endpoints.end()
-            ? std::nullopt
-            : std::optional<EndpointDiscoveryData>(match->data);
+        std::vector<EndpointDiscoveryData> readers;
+        for (const auto& endpoint : remote_endpoints) {
+            if (endpoint.data.kind == DiscoveredEndpointKind::reader &&
+                endpoint.data.topic_name == topic_name &&
+                endpoint.data.type_name == type_name &&
+                endpoint.data.reliable == writer_is_reliable) {
+                readers.push_back(endpoint.data);
+            }
+        }
+        return readers;
     }
 
     DiscoveryConfig config;
@@ -548,18 +546,47 @@ std::optional<EndpointDiscoveryData> DiscoveryService::wait_for_reader(
     bool writer_is_reliable,
     std::chrono::milliseconds timeout)
 {
+    auto readers = wait_for_readers(
+        topic_name,
+        type_name,
+        writer_is_reliable,
+        timeout);
+    if (readers.empty()) {
+        return std::nullopt;
+    }
+    return std::move(readers.front());
+}
+
+std::vector<EndpointDiscoveryData> DiscoveryService::wait_for_readers(
+    const std::string& topic_name,
+    const std::string& type_name,
+    bool writer_is_reliable,
+    std::chrono::milliseconds timeout)
+{
     std::unique_lock<std::mutex> lock(impl_->mutex);
     const auto predicate = [&] {
         return impl_->stop.load() ||
-               impl_->find_reader(topic_name, type_name, writer_is_reliable).has_value();
+               !impl_->find_readers(
+                    topic_name,
+                    type_name,
+                    writer_is_reliable).empty();
     };
 
     if (timeout.count() < 0) {
         impl_->condition.wait(lock, predicate);
     } else if (!impl_->condition.wait_for(lock, timeout, predicate)) {
-        return std::nullopt;
+        return {};
     }
-    return impl_->find_reader(topic_name, type_name, writer_is_reliable);
+    return impl_->find_readers(topic_name, type_name, writer_is_reliable);
+}
+
+std::vector<EndpointDiscoveryData> DiscoveryService::matching_readers(
+    const std::string& topic_name,
+    const std::string& type_name,
+    bool writer_is_reliable) const
+{
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->find_readers(topic_name, type_name, writer_is_reliable);
 }
 
 bool DiscoveryService::wait_for_participant(

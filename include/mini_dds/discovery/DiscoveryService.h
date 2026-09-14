@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace mini_dds::discovery {
 
@@ -47,6 +48,17 @@ public:
         const std::string& type_name,
         bool writer_is_reliable,
         std::chrono::milliseconds timeout);
+
+    std::vector<EndpointDiscoveryData> wait_for_readers(
+        const std::string& topic_name,
+        const std::string& type_name,
+        bool writer_is_reliable,
+        std::chrono::milliseconds timeout);
+
+    [[nodiscard]] std::vector<EndpointDiscoveryData> matching_readers(
+        const std::string& topic_name,
+        const std::string& type_name,
+        bool writer_is_reliable) const;
 
     bool wait_for_participant(
         const rtps::GuidPrefix& participant_prefix,

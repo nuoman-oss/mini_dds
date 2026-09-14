@@ -121,6 +121,7 @@ public:
     [[nodiscard]] transport::Endpoint local_endpoint() const;
     [[nodiscard]] bool discovery_enabled() const noexcept;
     [[nodiscard]] std::size_t discovered_participant_count() const;
+    [[nodiscard]] std::size_t discovered_endpoint_count() const;
 
     Publisher create_publisher() const;
     Subscriber create_subscriber() const;
@@ -151,11 +152,13 @@ public:
           writer_id_(config.writer_id
               ? *config.writer_id
               : state_->allocate_writer_id()),
-          remote_reader_id_(config.remote_reader_id),
-          discovery_timeout_(config.discovery_timeout)
+          discovery_timeout_(config.discovery_timeout),
+          uses_discovery_(config.remote_endpoint.port == 0)
     {
-        if (config.remote_endpoint.port != 0) {
-            create_writer(std::move(config.remote_endpoint), remote_reader_id_);
+        if (!uses_discovery_) {
+            create_writer({rtps::ReaderProxy{
+                std::move(config.remote_endpoint),
+                config.remote_reader_id}});
         } else if (!state_->discovery || !state_->discovery->is_valid()) {
             initialization_error_ =
                 "DataWriter requires a fixed remote endpoint or enabled discovery";
@@ -189,24 +192,8 @@ public:
             return false;
         }
 
-        if (!best_effort_writer_ && !reliable_writer_) {
-            const auto reader = state_->discovery->wait_for_reader(
-                topic_.name(),
-                topic_.type_name(),
-                qos_.reliability == ReliabilityKind::reliable,
-                discovery_timeout_);
-            if (!reader) {
-                last_error_ = "timed out waiting for a matching DataReader";
-                const auto discovery_error = state_->discovery->last_error();
-                if (!discovery_error.empty()) {
-                    last_error_ += ": " + discovery_error;
-                }
-                return false;
-            }
-
-            create_writer(
-                reader->unicast_locator,
-                reader->endpoint_guid.entity_id);
+        if (uses_discovery_ && !refresh_discovered_readers()) {
+            return false;
         }
 
         std::vector<std::uint8_t> payload;
@@ -243,10 +230,58 @@ public:
         return writer_id_;
     }
 
+    [[nodiscard]] std::size_t matched_reader_count() const noexcept
+    {
+        if (reliable_writer_) {
+            return reliable_writer_->matched_reader_count();
+        }
+        return best_effort_writer_
+            ? best_effort_writer_->matched_reader_count()
+            : 0;
+    }
+
 private:
-    void create_writer(
-        transport::Endpoint remote_endpoint,
-        rtps::EntityId remote_reader_id)
+    bool refresh_discovered_readers()
+    {
+        auto readers = state_->discovery->matching_readers(
+            topic_.name(),
+            topic_.type_name(),
+            qos_.reliability == ReliabilityKind::reliable);
+        if (readers.empty()) {
+            readers = state_->discovery->wait_for_readers(
+                topic_.name(),
+                topic_.type_name(),
+                qos_.reliability == ReliabilityKind::reliable,
+                discovery_timeout_);
+        }
+        if (readers.empty()) {
+            last_error_ = "timed out waiting for a matching DataReader";
+            const auto discovery_error = state_->discovery->last_error();
+            if (!discovery_error.empty()) {
+                last_error_ += ": " + discovery_error;
+            }
+            return false;
+        }
+
+        std::vector<rtps::ReaderProxy> reader_proxies;
+        reader_proxies.reserve(readers.size());
+        for (auto& reader : readers) {
+            reader_proxies.push_back(rtps::ReaderProxy{
+                std::move(reader.unicast_locator),
+                reader.endpoint_guid.entity_id});
+        }
+
+        if (reliable_writer_) {
+            reliable_writer_->set_readers(std::move(reader_proxies));
+        } else if (best_effort_writer_) {
+            best_effort_writer_->set_readers(std::move(reader_proxies));
+        } else {
+            create_writer(std::move(reader_proxies));
+        }
+        return true;
+    }
+
+    void create_writer(std::vector<rtps::ReaderProxy> readers)
     {
         if (qos_.reliability == ReliabilityKind::reliable) {
             rtps::ReliableWriterConfig reliable_config;
@@ -257,16 +292,14 @@ private:
                 *state_->transport,
                 state_->guid_prefix,
                 writer_id_,
-                std::move(remote_endpoint),
-                remote_reader_id,
+                std::move(readers),
                 reliable_config);
         } else {
             best_effort_writer_ = std::make_unique<rtps::StatelessWriter>(
                 *state_->transport,
                 state_->guid_prefix,
                 writer_id_,
-                std::move(remote_endpoint),
-                remote_reader_id,
+                std::move(readers),
                 qos_.history_depth);
         }
     }
@@ -275,13 +308,13 @@ private:
     Topic<T> topic_;
     EndpointQos qos_;
     rtps::EntityId writer_id_;
-    rtps::EntityId remote_reader_id_;
     std::chrono::milliseconds discovery_timeout_;
     std::unique_ptr<rtps::StatelessWriter> best_effort_writer_;
     std::unique_ptr<rtps::ReliableWriter> reliable_writer_;
     std::string initialization_error_;
     std::string last_error_;
     bool registered_with_discovery_{false};
+    bool uses_discovery_{false};
 };
 
 template<typename T>

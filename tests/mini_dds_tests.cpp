@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -42,8 +43,10 @@ void check(bool condition, const std::string& message)
 struct InMemoryTransportState {
     std::mutex mutex;
     std::condition_variable ready;
-    std::array<std::deque<mini_dds::transport::Datagram>, 2> queues;
+    std::array<std::deque<mini_dds::transport::Datagram>, 3> queues;
+    std::array<std::size_t, 3> data_send_counts{};
     bool drop_first_writer_data{false};
+    std::uint16_t drop_destination_port{0};
     std::size_t dropped_data_count{0};
 };
 
@@ -60,19 +63,32 @@ public:
 
     bool send(
         const std::vector<std::uint8_t>& data,
-        const mini_dds::transport::Endpoint&) override
+        const mini_dds::transport::Endpoint& destination) override
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
-        if (side_ == 0 && state_->drop_first_writer_data &&
-            state_->dropped_data_count == 0 &&
+        if (destination.address != "memory" || destination.port < 31000U ||
+            destination.port >= 31000U + state_->queues.size()) {
+            last_error_ = "invalid in-memory destination";
+            return false;
+        }
+        const auto destination_side = static_cast<std::size_t>(
+            destination.port - 31000U);
+        const bool is_data =
             data.size() > mini_dds::rtps::message_header_size &&
             data[mini_dds::rtps::message_header_size] ==
-                static_cast<std::uint8_t>(mini_dds::rtps::SubmessageKind::data)) {
+                static_cast<std::uint8_t>(mini_dds::rtps::SubmessageKind::data);
+        if (side_ == 0 && is_data) {
+            ++state_->data_send_counts[destination_side];
+        }
+        if (side_ == 0 && is_data && state_->drop_first_writer_data &&
+            state_->dropped_data_count == 0 &&
+            (state_->drop_destination_port == 0 ||
+             state_->drop_destination_port == destination.port)) {
             ++state_->dropped_data_count;
             return true;
         }
 
-        state_->queues[1U - side_].push_back({data, local_});
+        state_->queues[destination_side].push_back({data, local_});
         state_->ready.notify_all();
         return true;
     }
@@ -495,6 +511,51 @@ void test_stateless_best_effort_path()
     }
 }
 
+void test_stateless_multi_reader_fanout()
+{
+    using namespace mini_dds;
+
+    auto link = std::make_shared<InMemoryTransportState>();
+    InMemoryTransport writer_transport(link, 0);
+    InMemoryTransport first_reader_transport(link, 1);
+    InMemoryTransport second_reader_transport(link, 2);
+
+    const rtps::EntityId writer_id{{0x00, 0x00, 0x20, 0x03}};
+    const rtps::EntityId first_reader_id{{0x00, 0x00, 0x21, 0x04}};
+    const rtps::EntityId second_reader_id{{0x00, 0x00, 0x22, 0x04}};
+    rtps::StatelessWriter writer(
+        writer_transport,
+        {},
+        writer_id,
+        std::vector<rtps::ReaderProxy>{
+            {first_reader_transport.local_endpoint(), first_reader_id},
+            {second_reader_transport.local_endpoint(), second_reader_id}},
+        4);
+    rtps::StatelessReader first_reader(
+        first_reader_transport,
+        first_reader_id,
+        4);
+    rtps::StatelessReader second_reader(
+        second_reader_transport,
+        second_reader_id,
+        4);
+
+    const auto payload = serialization::serialize_string_payload("fanout sample");
+    check(writer.write(payload), "StatelessWriter fans out one change: " + writer.last_error());
+    check(writer.matched_reader_count() == 2, "StatelessWriter tracks two readers");
+    check(
+        first_reader.receive_once(std::chrono::seconds(1)).status ==
+            rtps::ReaderReceiveStatus::sample,
+        "first Best-Effort reader receives fan-out sample");
+    check(
+        second_reader.receive_once(std::chrono::seconds(1)).status ==
+            rtps::ReaderReceiveStatus::sample,
+        "second Best-Effort reader receives fan-out sample");
+    check(
+        first_reader.take().has_value() && second_reader.take().has_value(),
+        "both Best-Effort reader histories contain the sample");
+}
+
 void test_reliable_retransmission_path()
 {
     using namespace mini_dds;
@@ -562,6 +623,84 @@ void test_reliable_retransmission_path()
             value,
             error) && value == "recovered sample",
         "reliable path restores the retransmitted payload: " + error);
+}
+
+void test_reliable_multi_reader_fanout()
+{
+    using namespace mini_dds;
+
+    auto link = std::make_shared<InMemoryTransportState>();
+    link->drop_first_writer_data = true;
+    link->drop_destination_port = 31002;
+    InMemoryTransport writer_transport(link, 0);
+    InMemoryTransport first_reader_transport(link, 1);
+    InMemoryTransport second_reader_transport(link, 2);
+
+    const rtps::EntityId writer_id{{0x00, 0x00, 0x30, 0x03}};
+    const rtps::EntityId first_reader_id{{0x00, 0x00, 0x31, 0x04}};
+    const rtps::EntityId second_reader_id{{0x00, 0x00, 0x32, 0x04}};
+    rtps::ReliableWriterConfig config;
+    config.acknowledgment_timeout = std::chrono::milliseconds(100);
+    config.max_retries = 3;
+    config.history_depth = 4;
+    rtps::ReliableWriter writer(
+        writer_transport,
+        {},
+        writer_id,
+        std::vector<rtps::ReaderProxy>{
+            {first_reader_transport.local_endpoint(), first_reader_id},
+            {second_reader_transport.local_endpoint(), second_reader_id}},
+        config);
+    rtps::ReliableReader first_reader(
+        first_reader_transport,
+        {},
+        first_reader_id,
+        4);
+    rtps::ReliableReader second_reader(
+        second_reader_transport,
+        {},
+        second_reader_id,
+        4);
+
+    rtps::ReaderReceiveResult first_result;
+    rtps::ReaderReceiveResult second_result;
+    const auto receive_sample = [](
+                                    rtps::ReliableReader& reader,
+                                    rtps::ReaderReceiveResult& result) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        do {
+            result = reader.receive_once(std::chrono::milliseconds(200));
+        } while (result.status != rtps::ReaderReceiveStatus::sample &&
+                 result.status != rtps::ReaderReceiveStatus::error &&
+                 std::chrono::steady_clock::now() < deadline);
+    };
+    std::thread first_thread(receive_sample, std::ref(first_reader), std::ref(first_result));
+    std::thread second_thread(
+        receive_sample,
+        std::ref(second_reader),
+        std::ref(second_result));
+
+    const auto payload = serialization::serialize_string_payload("reliable fanout");
+    const bool write_ok = writer.write(payload);
+    first_thread.join();
+    second_thread.join();
+
+    check(write_ok, "ReliableWriter confirms all readers: " + writer.last_error());
+    check(writer.matched_reader_count() == 2, "ReliableWriter tracks two readers");
+    check(
+        first_result.status == rtps::ReaderReceiveStatus::sample &&
+            second_result.status == rtps::ReaderReceiveStatus::sample,
+        "both ReliableReaders receive the fan-out sample");
+    check(
+        link->data_send_counts[1] == 1 && link->data_send_counts[2] == 2,
+        "only the reader with a dropped DATA is retransmitted");
+    check(
+        writer.retransmission_count() == 1,
+        "ReliableWriter counts the per-reader retransmission");
+    check(
+        first_reader.take().has_value() && second_reader.take().has_value(),
+        "both ReliableReader histories contain the sample");
 }
 
 void test_reliable_reader_ordering_and_gap()
@@ -812,6 +951,109 @@ void test_dds_api_automatic_discovery()
     check(
         publisher_participant.discovered_participant_count() >= 1,
         "DomainParticipant exposes discovered participant count");
+}
+
+void test_dds_api_automatic_discovery_fanout()
+{
+    using namespace mini_dds;
+
+    dds::ParticipantConfig first_config;
+    first_config.domain_id = 93;
+    first_config.participant_id = 40;
+    first_config.bind_address = "0.0.0.0";
+    first_config.enable_discovery = true;
+    first_config.advertised_address = "127.0.0.1";
+    first_config.participant_name = "fanout-subscriber-a";
+    first_config.announcement_period = std::chrono::milliseconds(100);
+    first_config.lease_duration = std::chrono::seconds(2);
+
+    auto second_config = first_config;
+    second_config.participant_id = 41;
+    second_config.participant_name = "fanout-subscriber-b";
+    auto publisher_config = first_config;
+    publisher_config.participant_id = 42;
+    publisher_config.participant_name = "fanout-publisher";
+
+    dds::DomainParticipant first_participant(first_config);
+    dds::DomainParticipant second_participant(second_config);
+    dds::DomainParticipant publisher_participant(publisher_config);
+    check(
+        first_participant.is_valid() && second_participant.is_valid() &&
+            publisher_participant.is_valid(),
+        "three automatic-discovery participants start");
+    if (!first_participant.is_valid() || !second_participant.is_valid() ||
+        !publisher_participant.is_valid()) {
+        return;
+    }
+
+    const auto type_support = std::make_shared<dds::StringTypeSupport>();
+    const auto first_topic = first_participant.create_topic<std::string>(
+        "FanoutGreeting",
+        type_support);
+    const auto second_topic = second_participant.create_topic<std::string>(
+        "FanoutGreeting",
+        type_support);
+    const auto writer_topic = publisher_participant.create_topic<std::string>(
+        "FanoutGreeting",
+        type_support);
+
+    dds::DataReaderConfig reader_config;
+    reader_config.qos.reliability = dds::ReliabilityKind::reliable;
+    reader_config.qos.history_depth = 4;
+    auto first_reader = first_participant.create_subscriber().create_datareader(
+        first_topic,
+        reader_config);
+    auto second_reader = second_participant.create_subscriber().create_datareader(
+        second_topic,
+        reader_config);
+
+    dds::DataWriterConfig writer_config;
+    writer_config.discovery_timeout = std::chrono::seconds(3);
+    writer_config.qos.reliability = dds::ReliabilityKind::reliable;
+    writer_config.qos.history_depth = 4;
+    writer_config.qos.acknowledgment_timeout = std::chrono::milliseconds(200);
+    writer_config.qos.max_retries = 5;
+    auto writer = publisher_participant.create_publisher().create_datawriter(
+        writer_topic,
+        writer_config);
+
+    const auto discovery_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (publisher_participant.discovered_endpoint_count() < 2 &&
+           std::chrono::steady_clock::now() < discovery_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    check(
+        publisher_participant.discovered_endpoint_count() >= 2,
+        "publisher discovers both matching DataReaders");
+    if (publisher_participant.discovered_endpoint_count() < 2) {
+        return;
+    }
+
+    std::string first_sample;
+    std::string second_sample;
+    dds::TakeResult first_result;
+    dds::TakeResult second_result;
+    std::thread first_thread([&] {
+        first_result = first_reader->take(first_sample, std::chrono::seconds(5));
+    });
+    std::thread second_thread([&] {
+        second_result = second_reader->take(second_sample, std::chrono::seconds(5));
+    });
+
+    const bool write_ok = writer->write("automatic fanout sample");
+    first_thread.join();
+    second_thread.join();
+
+    check(write_ok, "discovered DataWriter writes to all readers: " + writer->last_error());
+    check(writer->matched_reader_count() == 2, "DataWriter exposes two matched readers");
+    check(
+        first_result.ok() && second_result.ok(),
+        "both discovered DataReaders receive the reliable sample");
+    check(
+        first_sample == "automatic fanout sample" &&
+            second_sample == "automatic fanout sample",
+        "automatic-discovery fan-out preserves both typed samples");
 }
 
 void test_udp_loopback()
@@ -1120,11 +1362,14 @@ int main()
     test_discovery_data_codecs();
     test_spdp_sedp_discovery_service();
     test_stateless_best_effort_path();
+    test_stateless_multi_reader_fanout();
     test_reliable_retransmission_path();
+    test_reliable_multi_reader_fanout();
     test_reliable_reader_ordering_and_gap();
     test_reliable_writer_timeout();
     test_dds_api_fixed_endpoint();
     test_dds_api_automatic_discovery();
+    test_dds_api_automatic_discovery_fanout();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
