@@ -1,50 +1,59 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.16)
 
+project(mini_dds VERSION 0.1.0 LANGUAGES CXX)
 
-project(miniDDS)
+option(MINI_DDS_BUILD_EXAMPLES "Build mini_dds examples" ON)
 
-
-
-set(CMAKE_CXX_STANDARD 17)
-
-
-
-include_directories(include)
-
-
-
-add_library(
-    udp_transport
-
-    src/UDPTransport.cpp
+add_library(mini_dds
+    src/dds/DomainParticipant.cpp
+    src/history/History.cpp
+    src/rtps/Data.cpp
+    src/rtps/Message.cpp
+    src/rtps/StatelessEndpoint.cpp
+    src/serialization/Cdr.cpp
+    src/serialization/SerializedPayload.cpp
+    src/transport/UDPTransport.cpp
 )
 
+add_library(mini_dds::mini_dds ALIAS mini_dds)
+add_library(udp_transport ALIAS mini_dds)
 
-
-add_executable(
-    sender
-
-    examples/sender.cpp
+target_include_directories(mini_dds
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
 
+target_compile_features(mini_dds PUBLIC cxx_std_17)
+set_target_properties(mini_dds PROPERTIES CXX_EXTENSIONS OFF)
 
-target_link_libraries(
-    sender
+if(MSVC)
+    target_compile_options(mini_dds PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(mini_dds PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 
-    udp_transport
-)
+if(WIN32)
+    target_link_libraries(mini_dds PRIVATE ws2_32)
+endif()
 
+if(MINI_DDS_BUILD_EXAMPLES)
+    add_executable(sender examples/sender.cpp)
+    target_link_libraries(sender PRIVATE mini_dds::mini_dds)
 
+    add_executable(receiver examples/receiver.cpp)
+    target_link_libraries(receiver PRIVATE mini_dds::mini_dds)
 
-add_executable(
-    receiver
+    add_executable(publisher examples/publisher.cpp)
+    target_link_libraries(publisher PRIVATE mini_dds::mini_dds)
 
-    examples/receiver.cpp
-)
+    add_executable(subscriber examples/subscriber.cpp)
+    target_link_libraries(subscriber PRIVATE mini_dds::mini_dds)
+endif()
 
+include(CTest)
 
-target_link_libraries(
-    receiver
-
-    udp_transport
-)
+if(BUILD_TESTING)
+    add_executable(mini_dds_tests tests/mini_dds_tests.cpp)
+    target_link_libraries(mini_dds_tests PRIVATE mini_dds::mini_dds)
+    add_test(NAME mini_dds_tests COMMAND mini_dds_tests)
+endif()
