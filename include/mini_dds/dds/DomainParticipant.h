@@ -178,6 +178,8 @@ public:
 
     ~DataWriter()
     {
+        reliable_writer_.reset();
+        best_effort_writer_.reset();
         if (registered_with_discovery_ && state_->discovery) {
             state_->discovery->remove_local_endpoint(
                 rtps::Guid{state_->guid_prefix, writer_id_});
@@ -215,6 +217,19 @@ public:
         return true;
     }
 
+    bool wait_for_acknowledgments(std::chrono::milliseconds timeout)
+    {
+        last_error_.clear();
+        if (!reliable_writer_) {
+            return true;
+        }
+        if (!reliable_writer_->wait_for_acknowledgments(timeout)) {
+            last_error_ = reliable_writer_->last_error();
+            return false;
+        }
+        return true;
+    }
+
     [[nodiscard]] const std::string& last_error() const noexcept
     {
         return last_error_;
@@ -230,7 +245,7 @@ public:
         return writer_id_;
     }
 
-    [[nodiscard]] std::size_t matched_reader_count() const noexcept
+    [[nodiscard]] std::size_t matched_reader_count() const
     {
         if (reliable_writer_) {
             return reliable_writer_->matched_reader_count();
@@ -238,6 +253,18 @@ public:
         return best_effort_writer_
             ? best_effort_writer_->matched_reader_count()
             : 0;
+    }
+
+    [[nodiscard]] std::size_t pending_change_count() const
+    {
+        return reliable_writer_
+            ? reliable_writer_->pending_change_count()
+            : 0;
+    }
+
+    [[nodiscard]] bool asynchronous() const noexcept
+    {
+        return reliable_writer_ && reliable_writer_->asynchronous();
     }
 
 private:
@@ -286,8 +313,11 @@ private:
         if (qos_.reliability == ReliabilityKind::reliable) {
             rtps::ReliableWriterConfig reliable_config;
             reliable_config.acknowledgment_timeout = qos_.acknowledgment_timeout;
+            reliable_config.heartbeat_period = qos_.heartbeat_period;
             reliable_config.max_retries = qos_.max_retries;
             reliable_config.history_depth = qos_.history_depth;
+            reliable_config.asynchronous =
+                qos_.publish_mode == PublishModeKind::asynchronous;
             reliable_writer_ = std::make_unique<rtps::ReliableWriter>(
                 *state_->transport,
                 state_->guid_prefix,

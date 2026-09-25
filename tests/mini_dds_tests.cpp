@@ -824,6 +824,113 @@ void test_reliable_writer_timeout()
         "ReliableWriter bounds its retry count");
 }
 
+void test_reliable_writer_asynchronous_queue()
+{
+    using namespace mini_dds;
+
+    auto link = std::make_shared<InMemoryTransportState>();
+    InMemoryTransport writer_transport(link, 0);
+    InMemoryTransport reader_transport(link, 1);
+    const rtps::EntityId writer_id{{0x00, 0x00, 0x61, 0x03}};
+    const rtps::EntityId reader_id{{0x00, 0x00, 0x62, 0x04}};
+
+    rtps::ReliableWriterConfig config;
+    config.acknowledgment_timeout = std::chrono::milliseconds(100);
+    config.heartbeat_period = std::chrono::milliseconds(20);
+    config.max_retries = 3;
+    config.history_depth = 4;
+    config.asynchronous = true;
+    rtps::ReliableWriter writer(
+        writer_transport,
+        {},
+        writer_id,
+        reader_transport.local_endpoint(),
+        reader_id,
+        config);
+    rtps::ReliableReader reader(reader_transport, {}, reader_id, 4);
+
+    std::vector<std::string> received_values;
+    std::string reader_error;
+    std::thread reader_thread([&] {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (received_values.size() < 2 &&
+               std::chrono::steady_clock::now() < deadline) {
+            const auto result = reader.receive_once(std::chrono::milliseconds(200));
+            if (result.status == rtps::ReaderReceiveStatus::error) {
+                reader_error = result.error;
+                return;
+            }
+            while (auto change = reader.take()) {
+                std::string value;
+                if (!serialization::deserialize_string_payload(
+                        change->serialized_payload,
+                        value,
+                        reader_error)) {
+                    return;
+                }
+                received_values.push_back(std::move(value));
+            }
+        }
+    });
+
+    const bool first_accepted = writer.write(
+        serialization::serialize_string_payload("async-one"));
+    const bool second_accepted = writer.write(
+        serialization::serialize_string_payload("async-two"));
+    const bool acknowledged = writer.wait_for_acknowledgments(
+        std::chrono::seconds(2));
+    reader_thread.join();
+
+    check(writer.asynchronous(), "ReliableWriter exposes asynchronous mode");
+    check(
+        first_accepted && second_accepted,
+        "asynchronous ReliableWriter accepts queued samples: " +
+            writer.last_error());
+    check(
+        acknowledged,
+        "asynchronous ReliableWriter waits for queued acknowledgments: " +
+            writer.last_error());
+    check(
+        writer.pending_change_count() == 0,
+        "asynchronous ReliableWriter drains its pending queue");
+    check(
+        reader_error.empty() &&
+            received_values == std::vector<std::string>{"async-one", "async-two"},
+        "asynchronous ReliableWriter preserves sample order: " + reader_error);
+}
+
+void test_reliable_writer_asynchronous_failure()
+{
+    using namespace mini_dds;
+
+    auto link = std::make_shared<InMemoryTransportState>();
+    InMemoryTransport writer_transport(link, 0);
+    rtps::ReliableWriterConfig config;
+    config.acknowledgment_timeout = std::chrono::milliseconds(20);
+    config.heartbeat_period = std::chrono::milliseconds(5);
+    config.max_retries = 1;
+    config.asynchronous = true;
+    rtps::ReliableWriter writer(
+        writer_transport,
+        {},
+        {{0x00, 0x00, 0x63, 0x03}},
+        {"memory", 31001},
+        {{0x00, 0x00, 0x64, 0x04}},
+        config);
+
+    check(
+        writer.write({0x00, 0x01, 0x00, 0x00}),
+        "asynchronous write reports queue acceptance");
+    check(
+        !writer.wait_for_acknowledgments(std::chrono::seconds(1)),
+        "asynchronous acknowledgment failure reaches the caller");
+    check(
+        writer.last_error().find("timed out") != std::string::npos &&
+            writer.pending_change_count() == 0,
+        "asynchronous failure retains its error after the queue drains");
+}
+
 void test_dds_api_fixed_endpoint()
 {
     using namespace mini_dds;
@@ -870,6 +977,76 @@ void test_dds_api_fixed_endpoint()
         non_blocking.status == dds::TakeStatus::timeout,
         "DataReader supports a non-blocking take");
 
+}
+
+void test_dds_api_asynchronous_reliable_writer()
+{
+    using namespace mini_dds;
+
+    dds::DomainParticipant subscriber_participant({8, 1, "127.0.0.1", 0});
+    dds::DomainParticipant publisher_participant({8, 2, "127.0.0.1", 0});
+    check(
+        subscriber_participant.is_valid() && publisher_participant.is_valid(),
+        "asynchronous DDS participants open");
+    if (!subscriber_participant.is_valid() || !publisher_participant.is_valid()) {
+        return;
+    }
+
+    const auto type_support = std::make_shared<dds::StringTypeSupport>();
+    const auto reader_topic = subscriber_participant.create_topic<std::string>(
+        "AsyncGreeting",
+        type_support);
+    const auto writer_topic = publisher_participant.create_topic<std::string>(
+        "AsyncGreeting",
+        type_support);
+
+    dds::DataReaderConfig reader_config;
+    reader_config.qos.reliability = dds::ReliabilityKind::reliable;
+    reader_config.qos.history_depth = 4;
+    auto reader = subscriber_participant.create_subscriber().create_datareader(
+        reader_topic,
+        reader_config);
+
+    dds::DataWriterConfig writer_config;
+    writer_config.remote_endpoint = {
+        "127.0.0.1",
+        subscriber_participant.local_endpoint().port};
+    writer_config.remote_reader_id = reader->entity_id();
+    writer_config.qos.reliability = dds::ReliabilityKind::reliable;
+    writer_config.qos.publish_mode = dds::PublishModeKind::asynchronous;
+    writer_config.qos.history_depth = 4;
+    writer_config.qos.acknowledgment_timeout = std::chrono::milliseconds(100);
+    writer_config.qos.heartbeat_period = std::chrono::milliseconds(20);
+    writer_config.qos.max_retries = 3;
+    auto writer = publisher_participant.create_publisher().create_datawriter(
+        writer_topic,
+        writer_config);
+
+    std::array<std::string, 2> samples;
+    std::array<dds::TakeResult, 2> results;
+    std::thread reader_thread([&] {
+        results[0] = reader->take(samples[0], std::chrono::seconds(3));
+        results[1] = reader->take(samples[1], std::chrono::seconds(3));
+    });
+
+    const bool first_accepted = writer->write("DDS async one");
+    const bool second_accepted = writer->write("DDS async two");
+    const bool acknowledged = writer->wait_for_acknowledgments(
+        std::chrono::seconds(3));
+    reader_thread.join();
+
+    check(writer->asynchronous(), "DataWriter exposes asynchronous Reliable QoS");
+    check(
+        first_accepted && second_accepted,
+        "DataWriter queues asynchronous typed samples: " + writer->last_error());
+    check(
+        acknowledged && writer->pending_change_count() == 0,
+        "DataWriter waits until its asynchronous queue is acknowledged: " +
+            writer->last_error());
+    check(
+        results[0].ok() && results[1].ok() &&
+            samples[0] == "DDS async one" && samples[1] == "DDS async two",
+        "DDS asynchronous Reliable path preserves typed sample order");
 }
 
 void test_dds_api_automatic_discovery()
@@ -1367,7 +1544,10 @@ int main()
     test_reliable_multi_reader_fanout();
     test_reliable_reader_ordering_and_gap();
     test_reliable_writer_timeout();
+    test_reliable_writer_asynchronous_queue();
+    test_reliable_writer_asynchronous_failure();
     test_dds_api_fixed_endpoint();
+    test_dds_api_asynchronous_reliable_writer();
     test_dds_api_automatic_discovery();
     test_dds_api_automatic_discovery_fanout();
 

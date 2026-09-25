@@ -92,18 +92,36 @@ ReliableWriter::ReliableWriter(
     : transport_(transport),
       message_header_{ProtocolVersion{2, 3}, VendorId{}, participant_prefix},
       writer_id_(writer_id),
-      readers_(unique_readers(std::move(readers))),
       config_(config),
-      history_(Guid{participant_prefix, writer_id}, config.history_depth)
+      history_(Guid{participant_prefix, writer_id}, config.history_depth),
+      readers_(unique_readers(std::move(readers)))
 {
     if (config_.acknowledgment_timeout.count() <= 0) {
         config_.acknowledgment_timeout = std::chrono::milliseconds(1);
+    }
+    if (config_.heartbeat_period.count() <= 0) {
+        config_.heartbeat_period = std::chrono::milliseconds(1);
+    }
+    if (config_.asynchronous) {
+        worker_ = std::thread([this] {
+            worker_loop();
+        });
+    }
+}
+
+ReliableWriter::~ReliableWriter()
+{
+    stopping_.store(true);
+    state_changed_.notify_all();
+    if (worker_.joinable()) {
+        worker_.join();
     }
 }
 
 bool ReliableWriter::send_change(
     const history::CacheChange& change,
-    const ReaderProxy& reader)
+    const ReaderProxy& reader,
+    std::string& error)
 {
     const DataMessage message{
         message_header_,
@@ -118,11 +136,11 @@ bool ReliableWriter::send_change(
             message,
             serialization::Endianness::little,
             bytes,
-            last_error_)) {
+            error)) {
         return false;
     }
     if (!transport_.send(bytes, reader.endpoint)) {
-        last_error_ = transport_.last_error();
+        error = transport_.last_error();
         return false;
     }
     return true;
@@ -130,7 +148,8 @@ bool ReliableWriter::send_change(
 
 bool ReliableWriter::send_heartbeat(
     SequenceNumber sequence_number,
-    const ReaderProxy& reader)
+    const ReaderProxy& reader,
+    std::string& error)
 {
     if (heartbeat_count_ == std::numeric_limits<std::int32_t>::max()) {
         heartbeat_count_ = 0;
@@ -148,33 +167,31 @@ bool ReliableWriter::send_heartbeat(
             heartbeat,
             serialization::Endianness::little,
             bytes,
-            last_error_)) {
+            error)) {
         return false;
     }
     if (!transport_.send(bytes, reader.endpoint)) {
-        last_error_ = transport_.last_error();
+        error = transport_.last_error();
         return false;
     }
     return true;
 }
 
-bool ReliableWriter::write(std::vector<std::uint8_t> serialized_payload)
+bool ReliableWriter::deliver_change(
+    const history::CacheChange& change,
+    const std::vector<ReaderProxy>& readers,
+    std::string& error)
 {
-    last_error_.clear();
-    if (readers_.empty()) {
-        last_error_ = "ReliableWriter has no matched readers";
-        return false;
-    }
-    const auto change = history_.add(std::move(serialized_payload));
-
     struct ReaderWriteState {
         ReaderProxy reader;
         bool acknowledged{false};
-        bool retry_requested{false};
+        std::size_t retries{0};
+        std::chrono::steady_clock::time_point retry_deadline{};
+        std::chrono::steady_clock::time_point heartbeat_deadline{};
     };
     std::vector<ReaderWriteState> states;
-    states.reserve(readers_.size());
-    for (const auto& reader : readers_) {
+    states.reserve(readers.size());
+    for (const auto& reader : readers) {
         states.push_back(ReaderWriteState{reader});
     }
 
@@ -186,105 +203,64 @@ bool ReliableWriter::write(std::vector<std::uint8_t> serialized_payload)
                 return state.acknowledged;
             });
     };
-    const auto every_pending_reader_requested_retry = [&states] {
-        return std::all_of(
+    const auto pending_count = [&states] {
+        return static_cast<std::size_t>(std::count_if(
             states.begin(),
             states.end(),
             [](const ReaderWriteState& state) {
-                return state.acknowledged || state.retry_requested;
-            });
+                return !state.acknowledged;
+            }));
     };
 
-    std::size_t attempt = 0;
-    while (true) {
+    auto now = std::chrono::steady_clock::now();
+    for (auto& state : states) {
+        if (!send_change(change, state.reader, error) ||
+            !send_heartbeat(change.sequence_number, state.reader, error)) {
+            return false;
+        }
+        state.retry_deadline = now + config_.acknowledgment_timeout;
+        state.heartbeat_deadline = now + config_.heartbeat_period;
+    }
+
+    while (!all_acknowledged()) {
+        if (stopping_.load()) {
+            error = "ReliableWriter stopped before acknowledgment completed";
+            return false;
+        }
+
+        now = std::chrono::steady_clock::now();
         for (auto& state : states) {
             if (state.acknowledged) {
                 continue;
             }
-            state.retry_requested = false;
-            if (attempt != 0) {
-                ++retransmission_count_;
-            }
-            if (!send_change(change, state.reader) ||
-                !send_heartbeat(change.sequence_number, state.reader)) {
-                return false;
-            }
-        }
 
-        const auto deadline =
-            std::chrono::steady_clock::now() + config_.acknowledgment_timeout;
-        while (true) {
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) {
-                break;
-            }
-            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - now);
-            const auto received = transport_.receive(remaining);
-            if (received.status == transport::ReceiveStatus::timeout) {
-                break;
-            }
-            if (!received.ok()) {
-                last_error_ = received.error;
-                return false;
-            }
-
-            MessageHeader header;
-            if (!decode_message_header(received.datagram.payload, header) ||
-                header.version.major != 2 ||
-                received.datagram.payload.size() <= message_header_size) {
-                continue;
-            }
-            SubmessageHeader submessage_header;
-            const auto* submessage =
-                received.datagram.payload.data() + message_header_size;
-            const auto submessage_size =
-                received.datagram.payload.size() - message_header_size;
-            if (!decode_submessage_header(
-                    submessage,
-                    submessage_size,
-                    submessage_header) ||
-                submessage_header.kind != SubmessageKind::acknack) {
-                continue;
-            }
-
-            AckNackSubmessage acknack;
-            std::string decode_error;
-            if (!decode_acknack_submessage(
-                    submessage,
-                    submessage_size,
-                    acknack,
-                    decode_error) ||
-                !(acknack.writer_id == writer_id_) ||
-                is_unknown_entity(acknack.reader_id)) {
-                continue;
-            }
-
-            const auto state = std::find_if(
-                states.begin(),
-                states.end(),
-                [&](const ReaderWriteState& current) {
-                    return !current.acknowledged &&
-                           acknack_matches_reader(
-                               acknack,
-                               received.datagram.source,
-                               current.reader);
-                });
-            if (state == states.end()) {
-                continue;
-            }
-            if (acknack_acknowledges(acknack, change.sequence_number) &&
-                !acknack_has_requests(acknack)) {
-                state->acknowledged = true;
-                if (all_acknowledged()) {
-                    return true;
+            if (now >= state.retry_deadline) {
+                if (state.retries == config_.max_retries) {
+                    error = "timed out waiting for ACKNACK from " +
+                        std::to_string(pending_count()) +
+                        " reader(s) after the initial transmission and " +
+                        std::to_string(config_.max_retries) + " retries";
+                    return false;
                 }
-            }
-            if (acknack.reader_state.contains(change.sequence_number)) {
-                state->retry_requested = true;
-            }
-            if (every_pending_reader_requested_retry()) {
-                break;
+                ++state.retries;
+                retransmission_count_.fetch_add(1);
+                if (!send_change(change, state.reader, error) ||
+                    !send_heartbeat(
+                        change.sequence_number,
+                        state.reader,
+                        error)) {
+                    return false;
+                }
+                state.retry_deadline = now + config_.acknowledgment_timeout;
+                state.heartbeat_deadline = now + config_.heartbeat_period;
+            } else if (now >= state.heartbeat_deadline) {
+                if (!send_heartbeat(
+                        change.sequence_number,
+                        state.reader,
+                        error)) {
+                    return false;
+                }
+                state.heartbeat_deadline = now + config_.heartbeat_period;
             }
         }
 
@@ -292,30 +268,224 @@ bool ReliableWriter::write(std::vector<std::uint8_t> serialized_payload)
             return true;
         }
 
-        if (attempt == config_.max_retries) {
-            break;
+        auto next_event = std::chrono::steady_clock::time_point::max();
+        for (const auto& state : states) {
+            if (!state.acknowledged) {
+                next_event = std::min(
+                    next_event,
+                    std::min(state.retry_deadline, state.heartbeat_deadline));
+            }
         }
-        ++attempt;
+        now = std::chrono::steady_clock::now();
+        auto receive_timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
+            next_event - now);
+        if (receive_timeout.count() <= 0) {
+            receive_timeout = std::chrono::milliseconds(1);
+        }
+        receive_timeout = std::min(
+            receive_timeout,
+            std::chrono::milliseconds(50));
+
+        const auto received = transport_.receive(receive_timeout);
+        if (received.status == transport::ReceiveStatus::timeout) {
+            continue;
+        }
+        if (!received.ok()) {
+            error = received.error;
+            return false;
+        }
+
+        MessageHeader header;
+        if (!decode_message_header(received.datagram.payload, header) ||
+            header.version.major != 2 ||
+            received.datagram.payload.size() <= message_header_size) {
+            continue;
+        }
+        SubmessageHeader submessage_header;
+        const auto* submessage =
+            received.datagram.payload.data() + message_header_size;
+        const auto submessage_size =
+            received.datagram.payload.size() - message_header_size;
+        if (!decode_submessage_header(
+                submessage,
+                submessage_size,
+                submessage_header) ||
+            submessage_header.kind != SubmessageKind::acknack) {
+            continue;
+        }
+
+        AckNackSubmessage acknack;
+        std::string decode_error;
+        if (!decode_acknack_submessage(
+                submessage,
+                submessage_size,
+                acknack,
+                decode_error) ||
+            !(acknack.writer_id == writer_id_) ||
+            is_unknown_entity(acknack.reader_id)) {
+            continue;
+        }
+
+        const auto state = std::find_if(
+            states.begin(),
+            states.end(),
+            [&](const ReaderWriteState& current) {
+                return !current.acknowledged &&
+                       acknack_matches_reader(
+                           acknack,
+                           received.datagram.source,
+                           current.reader);
+            });
+        if (state == states.end()) {
+            continue;
+        }
+        if (acknack_acknowledges(acknack, change.sequence_number) &&
+            !acknack_has_requests(acknack)) {
+            state->acknowledged = true;
+            continue;
+        }
+        if (acknack.reader_state.contains(change.sequence_number)) {
+            if (state->retries == config_.max_retries) {
+                error = "reader requested DATA after the retry limit was reached";
+                return false;
+            }
+            ++state->retries;
+            retransmission_count_.fetch_add(1);
+            if (!send_change(change, state->reader, error) ||
+                !send_heartbeat(
+                    change.sequence_number,
+                    state->reader,
+                    error)) {
+                return false;
+            }
+            now = std::chrono::steady_clock::now();
+            state->retry_deadline = now + config_.acknowledgment_timeout;
+            state->heartbeat_deadline = now + config_.heartbeat_period;
+        }
     }
 
-    const auto pending_count = static_cast<std::size_t>(std::count_if(
-        states.begin(),
-        states.end(),
-        [](const ReaderWriteState& state) { return !state.acknowledged; }));
-    last_error_ = "timed out waiting for ACKNACK from " +
-        std::to_string(pending_count) +
-        " reader(s) after the initial transmission and " +
-        std::to_string(config_.max_retries) + " retries";
-    return false;
+    return true;
+}
+
+bool ReliableWriter::write(std::vector<std::uint8_t> serialized_payload)
+{
+    std::lock_guard<std::mutex> write_lock(write_mutex_);
+
+    std::vector<ReaderProxy> readers;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (readers_.empty()) {
+            last_error_ = "ReliableWriter has no matched readers";
+            return false;
+        }
+        if (stopping_.load()) {
+            last_error_ = "ReliableWriter is stopping";
+            return false;
+        }
+        readers = readers_;
+        if (failed_count_ == observed_failure_count_) {
+            last_error_.clear();
+        }
+    }
+
+    auto change = history_.add(std::move(serialized_payload));
+    if (!config_.asynchronous) {
+        std::string error;
+        const auto delivered = deliver_change(change, readers, error);
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        last_error_ = std::move(error);
+        return delivered;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        pending_changes_.push_back(QueuedChange{
+            std::move(change),
+            std::move(readers),
+            ++submitted_count_});
+    }
+    state_changed_.notify_all();
+    return true;
+}
+
+void ReliableWriter::worker_loop()
+{
+    while (!stopping_.load()) {
+        QueuedChange queued;
+        {
+            std::unique_lock<std::mutex> lock(state_mutex_);
+            state_changed_.wait(lock, [this] {
+                return stopping_.load() || !pending_changes_.empty();
+            });
+            if (stopping_.load()) {
+                return;
+            }
+            queued = std::move(pending_changes_.front());
+            pending_changes_.pop_front();
+        }
+
+        std::string error;
+        const auto delivered = deliver_change(
+            queued.change,
+            queued.readers,
+            error);
+
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            completed_count_ = queued.submission_id;
+            if (!delivered && !stopping_.load()) {
+                ++failed_count_;
+                last_error_ = std::move(error);
+            }
+        }
+        state_changed_.notify_all();
+    }
 }
 
 void ReliableWriter::set_readers(std::vector<ReaderProxy> readers)
 {
+    std::lock_guard<std::mutex> lock(state_mutex_);
     readers_ = unique_readers(std::move(readers));
 }
 
-const std::string& ReliableWriter::last_error() const noexcept
+bool ReliableWriter::wait_for_acknowledgments(
+    std::chrono::milliseconds timeout)
 {
+    std::unique_lock<std::mutex> lock(state_mutex_);
+    if (!config_.asynchronous) {
+        return last_error_.empty();
+    }
+
+    const auto target = submitted_count_;
+    const auto completed = [this, target] {
+        return stopping_.load() || completed_count_ >= target;
+    };
+    bool ready = true;
+    if (timeout.count() < 0) {
+        state_changed_.wait(lock, completed);
+    } else {
+        ready = state_changed_.wait_for(lock, timeout, completed);
+    }
+    if (!ready) {
+        last_error_ = "timed out waiting for asynchronous acknowledgments";
+        return false;
+    }
+    if (stopping_.load()) {
+        last_error_ = "ReliableWriter stopped before acknowledgment completed";
+        return false;
+    }
+    if (failed_count_ != observed_failure_count_) {
+        observed_failure_count_ = failed_count_;
+        return false;
+    }
+
+    last_error_.clear();
+    return true;
+}
+
+std::string ReliableWriter::last_error() const
+{
+    std::lock_guard<std::mutex> lock(state_mutex_);
     return last_error_;
 }
 
@@ -326,12 +496,24 @@ const history::WriterHistory& ReliableWriter::history() const noexcept
 
 std::size_t ReliableWriter::retransmission_count() const noexcept
 {
-    return retransmission_count_;
+    return retransmission_count_.load();
 }
 
-std::size_t ReliableWriter::matched_reader_count() const noexcept
+std::size_t ReliableWriter::matched_reader_count() const
 {
+    std::lock_guard<std::mutex> lock(state_mutex_);
     return readers_.size();
+}
+
+std::size_t ReliableWriter::pending_change_count() const
+{
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return static_cast<std::size_t>(submitted_count_ - completed_count_);
+}
+
+bool ReliableWriter::asynchronous() const noexcept
+{
+    return config_.asynchronous;
 }
 
 ReliableReader::ReliableReader(

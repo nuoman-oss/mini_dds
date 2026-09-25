@@ -191,11 +191,11 @@ MVP 使用简单且可控的线程模型：
 
 - SPDP/SEDP 服务拥有独立的公告与接收线程；
 - 用户数据由调用 `DataReader::take()` 的线程同步收包和解析；
-- Best-Effort `write()` 只负责发送，Reliable `write()` 同步等待 ACKNACK；
+- Best-Effort `write()` 只负责发送；Reliable 默认同步等待 ACKNACK，也可配置后台发送队列；
 - 当前没有用户回调线程，样本统一通过 `take()` 取出；
 - 停止时通过有限接收超时退出，不依赖强制终止线程。
 
-后续性能优化可以引入任务队列，但不改变模块边界。
+异步 Reliable Writer 使用一个可停止的工作线程，按提交顺序逐条发送并确认。`write()` 表示样本已进入队列，`wait_for_acknowledgments()` 用于观察后台送达结果。
 
 ## 8. 标识与端口策略
 
@@ -299,12 +299,12 @@ MVP 使用简单且可控的线程模型：
 - [x] SEDP 可靠性匹配；
 - [x] 首包丢失恢复、确认超时与双进程集成测试。
 
-当前 Reliable 实现采用同步 stop-and-wait 模型：`write()` 向全部匹配 Reader 发送 DATA 与 HEARTBEAT，分别记录每个 Reader 的 ACKNACK；收到 NACK 或确认超时后，只向尚未确认的 Reader 在 `max_retries` 范围内重传。Reader 会缓存乱序 DATA，只把连续序列交给 ReaderHistory。
+当前 Reliable 实现的单条样本仍采用 stop-and-wait 模型：Writer 向全部匹配 Reader 发送 DATA 与 HEARTBEAT，分别记录每个 Reader 的 ACKNACK；收到 NACK 或确认超时后，只向尚未确认的 Reader 在 `max_retries` 范围内重传。同步发布由调用线程执行该过程，异步发布由后台工作线程执行。Reader 会缓存乱序 DATA，只把连续序列交给 ReaderHistory。
 
 当前 M5 限制：
 
 - SEDP 当前要求 Writer/Reader 可靠性精确相等，尚未实现完整的 requested/offered QoS 兼容规则；
-- 没有后台 HEARTBEAT 定时器，可靠写入会同步等待确认；
+- 没有独立的空闲期 HEARTBEAT 定时器；仅在存在待确认样本时周期发送 HEARTBEAT；
 - GAP 已支持编解码和 Reader 处理，但 Writer 尚未为已淘汰样本主动生成 GAP；
 - History 目前只有 KeepLast，Durability 目前只有 Volatile；
 - 尚未实现 DATA_FRAG、HEARTBEAT_FRAG 与 NACK_FRAG。
@@ -317,7 +317,23 @@ MVP 使用简单且可控的线程模型：
 - [x] 已确认 Reader 不参与其他 Reader 触发的重传；
 - [x] 双 Reader 自动发现与选择性丢包集成测试。
 
-当前 M6 仍保留同步写入语义；新加入或租约过期的 Reader 会在下一次 `write()` 刷新时加入或移出匹配集合。
+新加入或租约过期的 Reader 会在下一次 `write()` 刷新时加入或移出匹配集合；已入异步队列的样本保留其提交时的 Reader 快照。
+
+### M7：异步 Reliable 发布（已完成最小版本）
+
+- [x] `PublishModeKind::synchronous/asynchronous` QoS；
+- [x] Reliable Writer 后台 FIFO 队列与可停止工作线程；
+- [x] `write()` 入队语义与 `wait_for_acknowledgments()` 确认屏障；
+- [x] 待处理样本计数和后台失败回传；
+- [x] 连续样本顺序、ACK 超时和 DDS 类型化 API 集成测试。
+
+当前 M7 限制：
+
+- 后台只有一个工作线程，每条样本仍需完成全部 Reader 确认后才处理下一条；
+- 队列暂无限长，尚未实现容量上限、背压、批处理或多样本在途窗口；
+- 异步发布目前只用于 Reliable DataWriter，Best-Effort 仍由调用线程直接发送；
+- `write()` 成功只表示入队成功，后台错误必须通过 `wait_for_acknowledgments()` 获取；
+- 销毁 Writer 会停止工作线程并放弃尚未完成的队列，要求送达时需先显式等待。
 
 ## 12. 完成定义
 

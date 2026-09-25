@@ -2,7 +2,7 @@
 
 一个用于学习 DDS、RTPS 与实时通信的轻量级 C++17 项目。
 
-当前进度：完成带自动发现、Best-Effort/可靠一对多发布的 MVP，包括跨平台 UDP/组播、CDR、RTPS DATA/HEARTBEAT/ACKNACK/GAP、History Cache、SPDP/SEDP，以及 `DomainParticipant`、`Topic`、`Publisher/Subscriber`、`DataWriter/DataReader`。
+当前进度：完成带自动发现、Best-Effort/可靠一对多发布和异步 Reliable 写入的 MVP，包括跨平台 UDP/组播、CDR、RTPS DATA/HEARTBEAT/ACKNACK/GAP、History Cache、SPDP/SEDP，以及 `DomainParticipant`、`Topic`、`Publisher/Subscriber`、`DataWriter/DataReader`。
 
 完整设计与进度见 [架构文档](docs/architecture.md)。
 
@@ -38,4 +38,6 @@ Windows 多配置生成器的可执行文件通常位于 `build/Debug/` 或 `bui
 
 当前发现实现是 RTPS 发现协议的最小子集，能够让两个 mini_dds 进程互相发现，但尚不保证与第三方 DDS 实现互操作。
 
-Reliable 路径当前是多 Reader、逐 Reader 同步确认模型：`write()` 会等待所有匹配 Reader 的 ACKNACK，并仅对未确认 Reader 按 `EndpointQos::acknowledgment_timeout` 与 `max_retries` 有界重传。它适合学习协议和验证一对多丢包恢复，还不是完整 DDS 实现中的异步高吞吐可靠通道。
+Reliable 路径支持同步和异步两种发布模式。默认同步模式下，`write()` 会等待全部匹配 Reader 确认；把 `EndpointQos::publish_mode` 设为 `PublishModeKind::asynchronous` 后，`write()` 在样本进入后台 FIFO 队列后返回，应用可通过 `wait_for_acknowledgments()` 等待当前已提交样本完成。两种模式都只向未确认 Reader 按 `acknowledgment_timeout` 与 `max_retries` 有界重传。
+
+异步模式当前使用单工作线程逐条确认，没有批处理、队列容量限制或并行在途窗口。销毁 `DataWriter` 会停止后台发送；需要确保送达时，应在销毁前调用 `wait_for_acknowledgments()` 并检查返回值。
