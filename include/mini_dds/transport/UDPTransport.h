@@ -43,7 +43,7 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept override;
     [[nodiscard]] Endpoint local_endpoint() const override;
-    [[nodiscard]] const std::string& last_error() const noexcept override;
+    [[nodiscard]] std::string last_error() const override;
 
 private:
     class Impl;

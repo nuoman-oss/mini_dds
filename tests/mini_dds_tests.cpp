@@ -7,6 +7,7 @@
 #include "mini_dds/history/History.h"
 #include "mini_dds/rtps/Data.h"
 #include "mini_dds/rtps/Message.h"
+#include "mini_dds/rtps/ParticipantMessageRouter.h"
 #include "mini_dds/rtps/Reliability.h"
 #include "mini_dds/rtps/ReliableEndpoint.h"
 #include "mini_dds/rtps/StatelessEndpoint.h"
@@ -124,7 +125,7 @@ public:
         return local_;
     }
 
-    [[nodiscard]] const std::string& last_error() const noexcept override
+    [[nodiscard]] std::string last_error() const override
     {
         return last_error_;
     }
@@ -432,6 +433,92 @@ void test_rtps_reliability_messages()
             bytes,
             error),
         "ACKNACK rejects a bitmap larger than 256 bits");
+}
+
+void test_participant_message_router()
+{
+    using namespace mini_dds;
+
+    auto link = std::make_shared<InMemoryTransportState>();
+    auto participant_transport = std::make_shared<InMemoryTransport>(link, 0);
+    InMemoryTransport sender_transport(link, 1);
+    rtps::ParticipantMessageRouter router(participant_transport);
+    check(router.is_open(), "ParticipantMessageRouter starts");
+
+    const rtps::EntityId first_reader_id{{0x00, 0x00, 0x71, 0x04}};
+    const rtps::EntityId second_reader_id{{0x00, 0x00, 0x72, 0x04}};
+    const rtps::EntityId writer_id{{0x00, 0x00, 0x73, 0x03}};
+    auto first_reader = router.create_endpoint(
+        first_reader_id,
+        rtps::RoutedEndpointKind::reader);
+    auto second_reader = router.create_endpoint(
+        second_reader_id,
+        rtps::RoutedEndpointKind::reader);
+    auto writer = router.create_endpoint(
+        writer_id,
+        rtps::RoutedEndpointKind::writer);
+    check(
+        first_reader && second_reader && writer && router.endpoint_count() == 3,
+        "ParticipantMessageRouter registers reader and writer channels");
+
+    const rtps::MessageHeader header{{2, 3}, {}, {}};
+    const auto send_data = [&](rtps::EntityId reader_id, std::int64_t sequence) {
+        const rtps::DataMessage message{
+            header,
+            {reader_id, writer_id, {sequence}, {0x00, 0x01, 0x00, 0x00}}};
+        std::vector<std::uint8_t> bytes;
+        std::string error;
+        return rtps::encode_data_message(
+                   message,
+                   serialization::Endianness::little,
+                   bytes,
+                   error) &&
+               sender_transport.send(bytes, router.local_endpoint());
+    };
+
+    check(send_data(first_reader_id, 1), "router test sends targeted DATA");
+    check(
+        first_reader->receive(std::chrono::seconds(1)).ok(),
+        "targeted DATA reaches the matching reader channel");
+    check(
+        second_reader->receive(std::chrono::milliseconds(20)).status ==
+            transport::ReceiveStatus::timeout,
+        "targeted DATA does not reach another reader channel");
+
+    check(send_data({}, 2), "router test sends unknown-reader DATA");
+    check(
+        first_reader->receive(std::chrono::seconds(1)).ok() &&
+            second_reader->receive(std::chrono::seconds(1)).ok(),
+        "unknown-reader DATA is broadcast to all reader channels");
+
+    rtps::AckNackSubmessage acknack;
+    acknack.reader_id = first_reader_id;
+    acknack.writer_id = writer_id;
+    acknack.reader_state.bitmap_base = {3};
+    std::vector<std::uint8_t> acknack_bytes;
+    std::string error;
+    check(
+        rtps::encode_acknack_message(
+            header,
+            acknack,
+            serialization::Endianness::little,
+            acknack_bytes,
+            error) &&
+            sender_transport.send(acknack_bytes, router.local_endpoint()),
+        "router test sends targeted ACKNACK: " + error);
+    check(
+        writer->receive(std::chrono::seconds(1)).ok(),
+        "ACKNACK reaches the matching writer channel");
+
+    check(
+        !router.create_endpoint(
+            first_reader_id,
+            rtps::RoutedEndpointKind::reader),
+        "ParticipantMessageRouter rejects a duplicate endpoint EntityId");
+    first_reader.reset();
+    check(
+        router.endpoint_count() == 2,
+        "destroying a routed transport unregisters its endpoint channel");
 }
 
 void test_history_cache()
@@ -1049,6 +1136,108 @@ void test_dds_api_asynchronous_reliable_writer()
         "DDS asynchronous Reliable path preserves typed sample order");
 }
 
+void test_dds_participant_multi_endpoint_routing()
+{
+    using namespace mini_dds;
+
+    dds::DomainParticipant subscriber_participant({9, 1, "127.0.0.1", 0});
+    dds::DomainParticipant publisher_participant({9, 2, "127.0.0.1", 0});
+    check(
+        subscriber_participant.is_valid() && publisher_participant.is_valid(),
+        "multi-endpoint DDS participants open");
+    if (!subscriber_participant.is_valid() || !publisher_participant.is_valid()) {
+        return;
+    }
+
+    const auto type_support = std::make_shared<dds::StringTypeSupport>();
+    const auto first_reader_topic =
+        subscriber_participant.create_topic<std::string>(
+            "RoutedFirst",
+            type_support);
+    const auto second_reader_topic =
+        subscriber_participant.create_topic<std::string>(
+            "RoutedSecond",
+            type_support);
+    const auto first_writer_topic =
+        publisher_participant.create_topic<std::string>(
+            "RoutedFirst",
+            type_support);
+    const auto second_writer_topic =
+        publisher_participant.create_topic<std::string>(
+            "RoutedSecond",
+            type_support);
+
+    dds::DataReaderConfig reader_config;
+    reader_config.qos.reliability = dds::ReliabilityKind::reliable;
+    reader_config.qos.history_depth = 4;
+    auto subscriber = subscriber_participant.create_subscriber();
+    auto first_reader = subscriber.create_datareader(
+        first_reader_topic,
+        reader_config);
+    auto second_reader = subscriber.create_datareader(
+        second_reader_topic,
+        reader_config);
+
+    dds::DataWriterConfig first_writer_config;
+    first_writer_config.remote_endpoint = {
+        "127.0.0.1",
+        subscriber_participant.local_endpoint().port};
+    first_writer_config.remote_reader_id = first_reader->entity_id();
+    first_writer_config.qos.reliability = dds::ReliabilityKind::reliable;
+    first_writer_config.qos.history_depth = 4;
+    first_writer_config.qos.acknowledgment_timeout =
+        std::chrono::milliseconds(100);
+    first_writer_config.qos.heartbeat_period = std::chrono::milliseconds(20);
+    first_writer_config.qos.max_retries = 3;
+    auto second_writer_config = first_writer_config;
+    second_writer_config.remote_reader_id = second_reader->entity_id();
+
+    auto publisher = publisher_participant.create_publisher();
+    auto first_writer = publisher.create_datawriter(
+        first_writer_topic,
+        first_writer_config);
+    auto second_writer = publisher.create_datawriter(
+        second_writer_topic,
+        second_writer_config);
+
+    std::array<std::string, 2> samples;
+    std::array<dds::TakeResult, 2> take_results;
+    std::array<bool, 2> write_results{};
+    std::thread first_reader_thread([&] {
+        take_results[0] = first_reader->take(
+            samples[0],
+            std::chrono::seconds(3));
+    });
+    std::thread second_reader_thread([&] {
+        take_results[1] = second_reader->take(
+            samples[1],
+            std::chrono::seconds(3));
+    });
+    std::thread first_writer_thread([&] {
+        write_results[0] = first_writer->write("first routed sample");
+    });
+    std::thread second_writer_thread([&] {
+        write_results[1] = second_writer->write("second routed sample");
+    });
+
+    first_writer_thread.join();
+    second_writer_thread.join();
+    first_reader_thread.join();
+    second_reader_thread.join();
+
+    check(
+        write_results[0] && write_results[1],
+        "two Reliable DataWriters share one Participant without stealing ACKNACKs: " +
+            first_writer->last_error() + " " + second_writer->last_error());
+    check(
+        take_results[0].ok() && take_results[1].ok(),
+        "two Reliable DataReaders share one Participant without stealing DATA");
+    check(
+        samples[0] == "first routed sample" &&
+            samples[1] == "second routed sample",
+        "Participant routing preserves each reader's typed sample");
+}
+
 void test_dds_api_automatic_discovery()
 {
     using namespace mini_dds;
@@ -1532,6 +1721,7 @@ int main()
     test_serialized_string_payload();
     test_rtps_data_message();
     test_rtps_reliability_messages();
+    test_participant_message_router();
     test_history_cache();
     test_udp_loopback();
     test_rtps_port_mapping();
@@ -1548,6 +1738,7 @@ int main()
     test_reliable_writer_asynchronous_failure();
     test_dds_api_fixed_endpoint();
     test_dds_api_asynchronous_reliable_writer();
+    test_dds_participant_multi_endpoint_routing();
     test_dds_api_automatic_discovery();
     test_dds_api_automatic_discovery_fanout();
 

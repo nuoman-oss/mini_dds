@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -99,7 +100,26 @@ class UdpTransport::Impl {
 public:
     NativeSocket socket{invalid_socket};
     Endpoint local_endpoint;
+    mutable std::mutex error_mutex;
     std::string last_error;
+
+    void clear_error()
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        last_error.clear();
+    }
+
+    void set_error(std::string error)
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        last_error = std::move(error);
+    }
+
+    std::string error_copy() const
+    {
+        std::lock_guard<std::mutex> lock(error_mutex);
+        return last_error;
+    }
 
 #ifdef _WIN32
     bool winsock_started{false};
@@ -127,7 +147,7 @@ UdpTransport::UdpTransport(
 #ifdef _WIN32
     WSADATA winsock_data{};
     if (WSAStartup(MAKEWORD(2, 2), &winsock_data) != 0) {
-        impl_->last_error = socket_error("WSAStartup");
+        impl_->set_error(socket_error("WSAStartup"));
         return;
     }
     impl_->winsock_started = true;
@@ -135,7 +155,7 @@ UdpTransport::UdpTransport(
 
     impl_->socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (impl_->socket == invalid_socket) {
-        impl_->last_error = socket_error("socket");
+        impl_->set_error(socket_error("socket"));
         return;
     }
 
@@ -146,7 +166,7 @@ UdpTransport::UdpTransport(
             SO_REUSEADDR,
             &reuse_address,
             static_cast<SocketLength>(sizeof(reuse_address))) != 0) {
-        impl_->last_error = socket_error("setsockopt(SO_REUSEADDR)");
+        impl_->set_error(socket_error("setsockopt(SO_REUSEADDR)"));
         close_socket(impl_->socket);
         impl_->socket = invalid_socket;
         return;
@@ -160,7 +180,7 @@ UdpTransport::UdpTransport(
         parse_ipv4_address(bind_address, address.sin_addr);
         bind_address = "0.0.0.0";
     } else if (!parse_ipv4_address(bind_address, address.sin_addr)) {
-        impl_->last_error = "invalid IPv4 bind address: " + bind_address;
+        impl_->set_error("invalid IPv4 bind address: " + bind_address);
         close_socket(impl_->socket);
         impl_->socket = invalid_socket;
         return;
@@ -170,7 +190,7 @@ UdpTransport::UdpTransport(
             impl_->socket,
             reinterpret_cast<const sockaddr*>(&address),
             static_cast<SocketLength>(sizeof(address))) != 0) {
-        impl_->last_error = socket_error("bind");
+        impl_->set_error(socket_error("bind"));
         close_socket(impl_->socket);
         impl_->socket = invalid_socket;
         return;
@@ -182,7 +202,7 @@ UdpTransport::UdpTransport(
             impl_->socket,
             reinterpret_cast<sockaddr*>(&bound_address),
             &bound_address_size) != 0) {
-        impl_->last_error = socket_error("getsockname");
+        impl_->set_error(socket_error("getsockname"));
         close_socket(impl_->socket);
         impl_->socket = invalid_socket;
         return;
@@ -197,15 +217,15 @@ bool UdpTransport::send(
     const std::vector<std::uint8_t>& data,
     const Endpoint& destination)
 {
-    impl_->last_error.clear();
+    impl_->clear_error();
 
     if (!is_open()) {
-        impl_->last_error = "transport is not open";
+        impl_->set_error("transport is not open");
         return false;
     }
 
     if (data.size() > max_udp_payload_size) {
-        impl_->last_error = "UDP payload exceeds 65507 bytes";
+        impl_->set_error("UDP payload exceeds 65507 bytes");
         return false;
     }
 
@@ -214,7 +234,8 @@ bool UdpTransport::send(
     target.sin_port = htons(destination.port);
 
     if (::inet_pton(AF_INET, destination.address.c_str(), &target.sin_addr) != 1) {
-        impl_->last_error = "invalid IPv4 destination address: " + destination.address;
+        impl_->set_error(
+            "invalid IPv4 destination address: " + destination.address);
         return false;
     }
 
@@ -241,7 +262,7 @@ bool UdpTransport::send(
 #endif
 
     if (sent < 0) {
-        impl_->last_error = socket_error("sendto");
+        impl_->set_error(socket_error("sendto"));
         return false;
     }
 
@@ -260,23 +281,23 @@ bool UdpTransport::join_multicast_group(
     const std::string& group_address,
     const std::string& interface_address)
 {
-    impl_->last_error.clear();
+    impl_->clear_error();
     if (!is_open()) {
-        impl_->last_error = "transport is not open";
+        impl_->set_error("transport is not open");
         return false;
     }
 
     ip_mreq membership{};
     if (::inet_pton(AF_INET, group_address.c_str(), &membership.imr_multiaddr) != 1 ||
         !parse_ipv4_address(interface_address, membership.imr_interface)) {
-        impl_->last_error = "invalid IPv4 multicast group or interface address";
+        impl_->set_error("invalid IPv4 multicast group or interface address");
         return false;
     }
 
     const auto first_octet = static_cast<unsigned>(
         ntohl(membership.imr_multiaddr.s_addr) >> 24U);
     if (first_octet < 224U || first_octet > 239U) {
-        impl_->last_error = "IPv4 multicast group must be in 224.0.0.0/4";
+        impl_->set_error("IPv4 multicast group must be in 224.0.0.0/4");
         return false;
     }
 
@@ -286,7 +307,7 @@ bool UdpTransport::join_multicast_group(
             IP_ADD_MEMBERSHIP,
             &membership,
             static_cast<SocketLength>(sizeof(membership))) != 0) {
-        impl_->last_error = socket_error("setsockopt(IP_ADD_MEMBERSHIP)");
+        impl_->set_error(socket_error("setsockopt(IP_ADD_MEMBERSHIP)"));
         return false;
     }
     return true;
@@ -294,15 +315,15 @@ bool UdpTransport::join_multicast_group(
 
 bool UdpTransport::set_multicast_interface(const std::string& interface_address)
 {
-    impl_->last_error.clear();
+    impl_->clear_error();
     if (!is_open()) {
-        impl_->last_error = "transport is not open";
+        impl_->set_error("transport is not open");
         return false;
     }
 
     in_addr interface{};
     if (!parse_ipv4_address(interface_address, interface)) {
-        impl_->last_error = "invalid IPv4 multicast interface address";
+        impl_->set_error("invalid IPv4 multicast interface address");
         return false;
     }
 
@@ -312,7 +333,7 @@ bool UdpTransport::set_multicast_interface(const std::string& interface_address)
             IP_MULTICAST_IF,
             &interface,
             static_cast<SocketLength>(sizeof(interface))) != 0) {
-        impl_->last_error = socket_error("setsockopt(IP_MULTICAST_IF)");
+        impl_->set_error(socket_error("setsockopt(IP_MULTICAST_IF)"));
         return false;
     }
     return true;
@@ -320,9 +341,9 @@ bool UdpTransport::set_multicast_interface(const std::string& interface_address)
 
 bool UdpTransport::set_multicast_loopback(bool enabled)
 {
-    impl_->last_error.clear();
+    impl_->clear_error();
     if (!is_open()) {
-        impl_->last_error = "transport is not open";
+        impl_->set_error("transport is not open");
         return false;
     }
 
@@ -333,7 +354,7 @@ bool UdpTransport::set_multicast_loopback(bool enabled)
             IP_MULTICAST_LOOP,
             &loopback,
             static_cast<SocketLength>(sizeof(loopback))) != 0) {
-        impl_->last_error = socket_error("setsockopt(IP_MULTICAST_LOOP)");
+        impl_->set_error(socket_error("setsockopt(IP_MULTICAST_LOOP)"));
         return false;
     }
     return true;
@@ -349,11 +370,12 @@ std::vector<std::uint8_t> UdpTransport::receive()
 
 ReceiveResult UdpTransport::receive(std::chrono::milliseconds timeout)
 {
-    impl_->last_error.clear();
+    impl_->clear_error();
 
     if (!is_open()) {
-        impl_->last_error = "transport is not open";
-        return ReceiveResult{ReceiveStatus::error, {}, impl_->last_error};
+        const std::string error = "transport is not open";
+        impl_->set_error(error);
+        return ReceiveResult{ReceiveStatus::error, {}, error};
     }
 
     fd_set read_set;
@@ -385,8 +407,9 @@ ReceiveResult UdpTransport::receive(std::chrono::milliseconds timeout)
     }
 
     if (ready < 0) {
-        impl_->last_error = socket_error("select");
-        return ReceiveResult{ReceiveStatus::error, {}, impl_->last_error};
+        const auto error = socket_error("select");
+        impl_->set_error(error);
+        return ReceiveResult{ReceiveStatus::error, {}, error};
     }
 
     std::vector<std::uint8_t> payload(65535);
@@ -412,8 +435,9 @@ ReceiveResult UdpTransport::receive(std::chrono::milliseconds timeout)
 #endif
 
     if (received < 0) {
-        impl_->last_error = socket_error("recvfrom");
-        return ReceiveResult{ReceiveStatus::error, {}, impl_->last_error};
+        const auto error = socket_error("recvfrom");
+        impl_->set_error(error);
+        return ReceiveResult{ReceiveStatus::error, {}, error};
     }
 
     payload.resize(static_cast<std::size_t>(received));
@@ -424,8 +448,9 @@ ReceiveResult UdpTransport::receive(std::chrono::milliseconds timeout)
             &source.sin_addr,
             source_address.data(),
             static_cast<SocketLength>(source_address.size())) == nullptr) {
-        impl_->last_error = socket_error("inet_ntop");
-        return ReceiveResult{ReceiveStatus::error, {}, impl_->last_error};
+        const auto error = socket_error("inet_ntop");
+        impl_->set_error(error);
+        return ReceiveResult{ReceiveStatus::error, {}, error};
     }
 
     Datagram datagram{
@@ -445,9 +470,9 @@ Endpoint UdpTransport::local_endpoint() const
     return impl_->local_endpoint;
 }
 
-const std::string& UdpTransport::last_error() const noexcept
+std::string UdpTransport::last_error() const
 {
-    return impl_->last_error;
+    return impl_->error_copy();
 }
 
 } // namespace mini_dds::transport

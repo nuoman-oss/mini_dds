@@ -106,6 +106,7 @@ flowchart TB
 - `message`：RTPS Header、Submessage Header；
 - `messages`：DATA、HEARTBEAT、ACKNACK 等具体 Submessage；
 - `reader` / `writer`：RTPS 端点状态机；
+- `ParticipantMessageRouter`：单点收包并按 Submessage 类型与 EntityId 分发到端点队列；
 - `discovery`：SPDP 与 SEDP。
 
 协议解析必须先检查长度、标志位和字节序，再读取字段。任何网络输入都不能假定合法。
@@ -114,7 +115,7 @@ flowchart TB
 
 为应用提供较稳定的接口：
 
-- `DomainParticipant`：持有 Domain、GUID Prefix、传输和发现服务；
+- `DomainParticipant`：持有 Domain、GUID Prefix、传输、用户数据路由和发现服务；
 - `Topic`：Topic 名与类型名；
 - `Publisher` / `Subscriber`：端点容器；
 - `DataWriter<T>`：序列化并写入 WriterHistory；
@@ -190,7 +191,8 @@ UDP datagram
 MVP 使用简单且可控的线程模型：
 
 - SPDP/SEDP 服务拥有独立的公告与接收线程；
-- 用户数据由调用 `DataReader::take()` 的线程同步收包和解析；
+- 每个 Participant 由一个 `ParticipantMessageRouter` 线程接收用户数据报；
+- 路由线程按 EntityId 把报文放入端点队列，`DataReader::take()` 从自己的队列同步解析；
 - Best-Effort `write()` 只负责发送；Reliable 默认同步等待 ACKNACK，也可配置后台发送队列；
 - 当前没有用户回调线程，样本统一通过 `take()` 取出；
 - 停止时通过有限接收超时退出，不依赖强制终止线程。
@@ -232,6 +234,7 @@ MVP 使用简单且可控的线程模型：
 - 两个进程固定端点发布订阅；
 - 丢包、乱序、重复包；
 - Participant 自动发现；
+- 同一 Participant 上多个 Reader/Writer 的并发路由；
 - 使用 Wireshark 检查报文字段；
 - 最终与 Fast DDS 或 Cyclone DDS 做有限互操作验证。
 
@@ -269,9 +272,9 @@ MVP 使用简单且可控的线程模型：
 - [x] DataWriter/DataReader；
 - [x] RAII 生命周期与资源释放。
 
-当前 M3 有意保留以下限制：
+当前 M3 API 状态：
 
-- 一个 Participant 暂时只应有一个主动收包的 DataReader；
+- 一个 Participant 可同时持有多个 DataReader/DataWriter，用户数据由 M8 路由层隔离；
 - Writer 可以使用固定远端，也可以通过 SEDP 自动匹配全部同 Topic、同类型 Reader；
 - Best-Effort 与 Reliable 均已接入统一的 `DataWriter`/`DataReader` API。
 
@@ -334,6 +337,23 @@ MVP 使用简单且可控的线程模型：
 - 异步发布目前只用于 Reliable DataWriter，Best-Effort 仍由调用线程直接发送；
 - `write()` 成功只表示入队成功，后台错误必须通过 `wait_for_acknowledgments()` 获取；
 - 销毁 Writer 会停止工作线程并放弃尚未完成的队列，要求送达时需先显式等待。
+
+### M8：Participant 多端点接收与路由（已完成最小版本）
+
+- [x] Participant 级单一用户数据接收线程；
+- [x] 每个 Reader/Writer 独立的 `ITransport` 接收队列适配器；
+- [x] DATA、HEARTBEAT、GAP 按 ReaderId 路由；
+- [x] ACKNACK 按 WriterId 路由；
+- [x] Unknown ReaderId 向全部本地 Reader 广播；
+- [x] 端点注册、重复 EntityId 检查和 RAII 注销；
+- [x] 双 Reliable Reader 与双 Reliable Writer 并发集成测试。
+
+当前 M8 限制：
+
+- 路由器目前只处理每个 RTPS Message 中的第一个 Submessage；
+- 尚未处理 INFO_DST、INFO_TS 等上下文 Submessage 和复合消息；
+- 端点接收队列暂无限长，尚未提供容量限制和溢出策略；
+- 路由阶段会调用现有解码器提取 EntityId，后续可改为轻量头部解析以减少 DATA Payload 复制。
 
 ## 12. 完成定义
 

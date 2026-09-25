@@ -2,7 +2,7 @@
 
 一个用于学习 DDS、RTPS 与实时通信的轻量级 C++17 项目。
 
-当前进度：完成带自动发现、Best-Effort/可靠一对多发布和异步 Reliable 写入的 MVP，包括跨平台 UDP/组播、CDR、RTPS DATA/HEARTBEAT/ACKNACK/GAP、History Cache、SPDP/SEDP，以及 `DomainParticipant`、`Topic`、`Publisher/Subscriber`、`DataWriter/DataReader`。
+当前进度：完成带自动发现、Best-Effort/可靠一对多发布、异步 Reliable 写入和 Participant 多端点路由的 MVP，包括跨平台 UDP/组播、CDR、RTPS DATA/HEARTBEAT/ACKNACK/GAP、History Cache、SPDP/SEDP，以及 `DomainParticipant`、`Topic`、`Publisher/Subscriber`、`DataWriter/DataReader`。
 
 完整设计与进度见 [架构文档](docs/architecture.md)。
 
@@ -37,6 +37,8 @@ Windows 多配置生成器的可执行文件通常位于 `build/Debug/` 或 `bui
 `sender`/`receiver` 可用于单独验证裸 UDP 传输层。固定地址方式仍可通过 `DataWriterConfig::remote_endpoint` 使用。
 
 当前发现实现是 RTPS 发现协议的最小子集，能够让两个 mini_dds 进程互相发现，但尚不保证与第三方 DDS 实现互操作。
+
+每个 `DomainParticipant` 由一个用户数据接收线程读取底层 UDP Socket，再根据 Submessage 类型和 EntityId 把 DATA/HEARTBEAT/GAP 分发给 Reader，把 ACKNACK 分发给 Writer。因此同一 Participant 可以同时运行多个 DataReader/DataWriter，不再由端点线程竞争同一个 Socket。
 
 Reliable 路径支持同步和异步两种发布模式。默认同步模式下，`write()` 会等待全部匹配 Reader 确认；把 `EndpointQos::publish_mode` 设为 `PublishModeKind::asynchronous` 后，`write()` 在样本进入后台 FIFO 队列后返回，应用可通过 `wait_for_acknowledgments()` 等待当前已提交样本完成。两种模式都只向未确认 Reader 按 `acknowledgment_timeout` 与 `max_retries` 有界重传。
 

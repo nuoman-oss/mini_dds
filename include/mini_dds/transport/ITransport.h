@@ -38,7 +38,7 @@ public:
 
     [[nodiscard]] virtual bool is_open() const noexcept = 0;
     [[nodiscard]] virtual Endpoint local_endpoint() const = 0;
-    [[nodiscard]] virtual const std::string& last_error() const noexcept = 0;
+    [[nodiscard]] virtual std::string last_error() const = 0;
 };
 
 } // namespace mini_dds::transport

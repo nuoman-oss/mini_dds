@@ -70,6 +70,13 @@ DomainParticipant::DomainParticipant(ParticipantConfig config)
         return;
     }
 
+    state_->message_router =
+        std::make_shared<rtps::ParticipantMessageRouter>(state_->transport);
+    if (!state_->message_router->is_open()) {
+        last_error_ = state_->message_router->last_error();
+        return;
+    }
+
     if (state_->config.enable_discovery) {
         discovery::DiscoveryConfig discovery_config;
         discovery_config.domain_id = state_->config.domain_id;
@@ -95,6 +102,7 @@ bool DomainParticipant::is_valid() const noexcept
 {
     return state_ != nullptr && state_->transport != nullptr &&
            state_->transport->is_open() &&
+           state_->message_router && state_->message_router->is_open() &&
            (!state_->config.enable_discovery ||
             (state_->discovery && state_->discovery->is_valid()));
 }
